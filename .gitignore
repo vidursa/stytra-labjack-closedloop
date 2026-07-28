@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Large media — GitHub rejects files over 100 MB. The simulation "camera"
+# video (Basler_*.mp4, ~110 MB) is NOT tracked here; copy it onto each machine
+# by hand (USB / shared drive / OneDrive) or set up Git LFS. See SETUP.md.
+# ---------------------------------------------------------------------------
+*.mp4
+*.avi
+*.h5.large
+
+# Session output (everything the experiment writes goes here)
+recordings/*
+!recordings/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.conda/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# stytra writes this to your HOME (not the repo) but ignore if it lands here
+stytra_last_config.json

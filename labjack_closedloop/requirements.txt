@@ -1,0 +1,8 @@
+# Extra dependencies for the closed-loop LabJack experiment, on top of stytra.
+# Install stytra itself separately (see README) - preferably the local copy:
+#     pip install -e ../stytra
+#
+# Runtime extras:
+av               # PyAV - decoding the .mp4 "camera" video (VideoFileSource)
+opencv-python    # required by stytra's tail tracking
+LabJackPython    # 'u3' module - ONLY needed when driving real LabJack hardware

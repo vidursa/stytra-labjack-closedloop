@@ -1,0 +1,12 @@
+bump2version
+flake8
+tox
+Sphinx
+
+pytest
+pytest-cov
+black==22.3.0
+
+pytest-qt
+pytest-forked
+pytest-xdist

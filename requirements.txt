@@ -1,0 +1,15 @@
+# Python dependencies for the closed-loop tail-bend -> LabJack experiment,
+# ON TOP OF stytra. Install stytra FIRST from the vendored copy in this repo:
+#
+#     pip install -e ./stytra
+#
+# then these extras:
+#
+#     pip install -r requirements.txt
+#
+# (See SETUP.md for the full, from-scratch walkthrough.)
+
+av               # PyAV — decodes the .mp4 "camera" video (simulate mode)
+opencv-python    # required by stytra's tail tracking
+LabJackPython    # the 'u3' module — ONLY needed to drive the real LabJack U3
+matplotlib       # plot_session.py — inspect a session offline
