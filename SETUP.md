@@ -32,15 +32,10 @@ folder. (Or `git clone <url>` on the command line.)
 
 ## 2. Put the simulation video in place ⚠️
 
-The "camera" video **`Basler_acA640-750um__25004149__20260513_144734755.mp4`**
-(~110 MB) is **not stored in git** — it is larger than GitHub's 100 MB per-file
+The "camera" video is **not stored in git** — it is larger than GitHub's 100 MB per-file
 limit, so it is deliberately git-ignored.
 
-Copy it into the **repo root** (next to `labjack_closedloop/` and
-`Basler_*_trackingparams.json`) by hand:
-
-- USB stick / shared network drive / OneDrive / Google Drive, **or**
-- set up [Git LFS](https://git-lfs.com) if you would rather version it.
+Copy it into the **repo root** (next to `labjack_closedloop/`).
 
 `run_experiment.py` expects it at exactly that path and will stop with
 `FileNotFoundError: Video not found: ...` if it is missing. (On the real rig you
