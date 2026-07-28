@@ -82,25 +82,7 @@ python run_experiment.py            # camera + tracking go live; press ▶ to re
 Full details, including how to obtain the simulation video (which is **not**
 stored in git), are in **[`SETUP.md`](SETUP.md)**.
 
-## Why stytra is vendored
-
-`stytra/` is an **unmodified** copy of stytra 0.8.34 (verified byte-identical to
-its upstream release). It is included in the repo so that a fresh machine gets
-exactly the version this project was built against — stytra pins to old
-`numba` / `PyQt5`, and installing the matching release from PyPI on a modern
-interpreter is fragile. `pip install -e ./stytra` uses this copy directly. All of
-the closed-loop code is purely *additive*; nothing inside `stytra/` is patched.
-
 ## Licensing
 
-Vendored **stytra is GPLv3+** (see `stytra/LICENSE.txt`). Because a GPL library
-is bundled here, distributing the combined work carries GPL obligations — bear
-that in mind before choosing a license for your own code under
-`labjack_closedloop/`. No license is asserted on that code yet; add one that is
-GPLv3-compatible if you intend to share it.
+Vendored **stytra is GPLv3+** (see `stytra/LICENSE.txt`).
 
-## Repository name
-
-Suggested name for the GitHub repo: **`stytra-tailbend-labjack`**.
-Alternatives that read well: `tailbend-closed-loop`, `zebrafish-closed-loop-stim`,
-`tailbeat-optostim`.
