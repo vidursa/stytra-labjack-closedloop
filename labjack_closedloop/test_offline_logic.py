@@ -18,6 +18,8 @@ from bend_trigger import (
     RightBendDetector,
     FixedWidthPulseController,
     PredictiveBendController,
+    DelayLine,
+    BaselineTracker,
 )
 from labjack_device import LabJackU3Output
 
@@ -160,6 +162,142 @@ def test_pulse_controller_display_window():
     print("ok  pulse controller: circle display window")
 
 
+def test_delay_line_zero_is_immediate():
+    # delay 0: a pushed pulse is due on the same frame -> identical to firing
+    # on detection (backwards compatible).
+    dl = DelayLine(0.0)
+    dl.push(1.0)
+    assert dl.pop_due(1.0) == 1
+    assert dl.pending == 0
+    print("ok  delay line: zero delay fires immediately")
+
+
+def test_delay_line_postpones_by_fixed_time():
+    # A detection at t=1.000 with a 50 ms delay must not emit until t>=1.050,
+    # and then exactly once.
+    dl = DelayLine(0.050)
+    dl.push(1.000)
+    dt = 0.005
+    fired_times = []
+    for i in range(int(round(1.0 / dt)) + 1):
+        t = 1.000 + i * dt
+        if dl.pop_due(t):
+            fired_times.append(t)
+    assert len(fired_times) == 1, fired_times
+    assert abs(fired_times[0] - 1.050) < 1e-9, fired_times
+    print("ok  delay line: postpones a pulse by the fixed delay, once")
+
+
+def test_delay_line_preserves_spacing_no_bunching():
+    # Constant delay preserves detection spacing: at most one pulse comes due per
+    # frame, so scheduled pulses never bunch up.
+    dl = DelayLine(0.030)
+    dt = 0.005
+    detections = {0.010, 0.150, 0.290}  # well separated
+    fired = 0
+    max_per_frame = 0
+    t = 0.0
+    for _ in range(120):
+        # push any detection that occurs on this frame
+        for d in list(detections):
+            if abs(d - t) < 1e-9:
+                dl.push(d)
+        n = dl.pop_due(t)
+        max_per_frame = max(max_per_frame, n)
+        fired += n
+        t += dt
+    assert fired == 3, fired
+    assert max_per_frame == 1, max_per_frame
+    print("ok  delay line: constant delay preserves spacing (no bunching)")
+
+
+def test_fixed_mode_with_delay_shifts_pulse():
+    # Full fixed-mode replay: detection on the rising edge, but the emitted
+    # pulse lands stim_delay_s later. Emulates the stimulus update() loop.
+    pc = FixedWidthPulseController(pulse_width_s=0.005, refractory_s=0.1)
+    dl = DelayLine(0.040)
+    dt = 0.005
+    detect_t, emit_t = None, None
+    for i in range(60):
+        t = i * dt
+        over = 5 <= i < 25  # sustained bend, rising edge at i=5 (t=0.025)
+        if pc.step(t, over):
+            detect_t = t
+            dl.push(t)
+        if dl.pop_due(t) and emit_t is None:
+            emit_t = t
+    assert abs(detect_t - 0.025) < 1e-9, detect_t
+    assert abs(emit_t - 0.065) < 1e-9, emit_t     # 0.025 + 0.040
+    assert abs((emit_t - detect_t) - 0.040) < 1e-9
+    print("ok  fixed mode + delay: pulse emitted stim_delay_s after detection")
+
+
+def test_baseline_off_and_fixed():
+    off = BaselineTracker(mode="off")
+    assert off.update(0.0, 0.17) == 0.0  # no correction
+    fixed = BaselineTracker(mode="fixed", offset=0.17)
+    assert fixed.update(0.0, 5.0) == 0.17  # constant, ignores input
+    assert fixed.update(1.0, -3.0) == 0.17
+    print("ok  baseline: off = 0, fixed = constant offset")
+
+
+def test_baseline_makes_threshold_symmetric():
+    # A trace resting at 0.17 that beats +-0.9 about rest. With a right-detector
+    # at threshold 0.8 and NO correction, the +0.17 bias makes the right side
+    # trigger while the equal-magnitude left side would not: asymmetric.
+    det = RightBendDetector(threshold=0.8, direction=1)
+    rest = 0.17
+    right_peak = rest + 0.9   # 1.07
+    left_peak = rest - 0.9    # -0.73
+    # raw (no baseline): right triggers, left (mirror) does not -> asymmetric
+    assert det.is_triggered(right_peak) and not det.is_triggered(-right_peak)
+    # with the baseline removed, the SAME excursion each way is symmetric:
+    bl = BaselineTracker(mode="fixed", offset=rest)
+    b = bl.update(0.0, rest)
+    assert det.is_triggered(right_peak - b)          # +0.9 -> triggers
+    assert not det.is_triggered(left_peak - b)       # -0.9 -> does not
+    # a mirror-image right bend of the same size past rest also triggers,
+    # confirming both sides are now measured from rest, not from 0.
+    assert det.is_triggered((rest + 0.9) - b)
+    print("ok  baseline: re-zeroing makes both sides equidistant from rest")
+
+
+def test_baseline_start_freezes_after_window():
+    bl = BaselineTracker(mode="start", window_s=0.1)
+    dt = 0.01
+    # first 0.1 s rests at 0.20 -> baseline converges to ~0.20 and freezes
+    for i in range(11):
+        bl.update(i * dt, 0.20)
+    assert bl.frozen, "start baseline should freeze after the window"
+    assert abs(bl.value - 0.20) < 1e-6, bl.value
+    # afterwards the fish beats hard; the frozen baseline must NOT move
+    for i in range(11, 60):
+        bl.update(i * dt, 0.20 + math.sin(i))
+    assert abs(bl.value - 0.20) < 1e-6, bl.value
+    print("ok  baseline: start mode freezes the resting offset after the window")
+
+
+def test_baseline_running_tracks_drift_not_beats():
+    # Slow drift of the resting point from 0.0 to 0.30 with a fast beat on top.
+    # A running mean over ~5 beats should sit near the drifting rest, NOT the beat.
+    bl = BaselineTracker(mode="running", window_s=0.5)
+    fps, freq = 200.0, 12.0
+    n = int(2.0 * fps)
+    last = None
+    for i in range(n):
+        t = i / fps
+        drift = 0.30 * (t / 2.0)                     # 0 -> 0.30 over 2 s
+        beat = 0.9 * math.sin(2 * math.pi * freq * t)
+        last = bl.update(t, drift + beat)
+    # near the end the rest is ~0.30; the running baseline should be close to it
+    # and far from the instantaneous beat amplitude.
+    assert abs(last - 0.30) < 0.08, last
+    # nan holds the estimate
+    held = bl.update(2.0, float("nan"))
+    assert held == last
+    print("ok  baseline: running mode follows slow drift, averages out beats")
+
+
 def _sine_beats(n_beats=5, amp=1.2, fps=200.0, freq=12.0, direction=1):
     """A clean oscillatory tail_sum trace: direction*amp*sin(2*pi*freq*t)."""
     n = int(round(n_beats / freq * fps))
@@ -235,4 +373,12 @@ if __name__ == "__main__":
     test_predictive_fires_before_trigger_side()
     test_predictive_fire_level_shifts_timing()
     test_predictive_needs_opposite_excursion()
+    test_delay_line_zero_is_immediate()
+    test_delay_line_postpones_by_fixed_time()
+    test_delay_line_preserves_spacing_no_bunching()
+    test_fixed_mode_with_delay_shifts_pulse()
+    test_baseline_off_and_fixed()
+    test_baseline_makes_threshold_symmetric()
+    test_baseline_start_freezes_after_window()
+    test_baseline_running_tracks_drift_not_beats()
     print("\nAll offline logic tests passed.")

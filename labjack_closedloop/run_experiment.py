@@ -16,6 +16,7 @@ Usage (inside a stytra environment, see README):
     python run_experiment.py
 """
 
+
 import argparse
 import json
 import os
@@ -42,7 +43,7 @@ SAVE_DIR = REPO_ROOT / "recordings"
 # --- hardware config -----------------------------------------------------
 # Set LABJACK_BACKEND = "u3" when a real LabJack U3 is connected (see
 # HARDWARE_GUIDE.md). "simulate" records + prints every transition instead.
-LABJACK_BACKEND = "simulate"
+LABJACK_BACKEND = "u3" #""simulate"
 # U3-HV: FIO0-FIO3 are fixed analog inputs, so a digital output must use
 # FIO4-FIO7 (or EIO0-EIO7). FIO4 gives a 3.3 V logic pulse. For a true ~5 V
 # level set LABJACK_CHANNEL = "DAC0" and LABJACK_VOLTAGE = 5.0.
@@ -54,7 +55,7 @@ LABJACK_VOLTAGE = 3.3      # nominal logic-high level (for logging)
 # live camera. Real rig: set True and describe the camera in REAL_CAMERA (the
 # `type` keys into stytra's camera_class_dict: basler/ximea/avt/spinnaker/
 # mikrotron/opencv). See HARDWARE_GUIDE.md.
-USE_REAL_CAMERA = False
+USE_REAL_CAMERA = True
 REAL_CAMERA = dict(type="basler", max_buffer_length=12000)
 
 # Acquisition rate. This is ALSO the framerate stamped into the saved .mp4:
@@ -81,10 +82,28 @@ TTL_STREAM_HZ = 1000
 TTL_STREAM_CONFIG_ANALOG = False
 
 # --- trigger config ------------------------------------------------------
-# Trigger when the raw tail_sum (radians, the value shown in the stytra plot)
-# exceeds this threshold to the right.
-BEND_THRESHOLD = 1.0
+# Trigger when the tail_sum (radians, the value shown in the stytra plot),
+# AFTER baseline re-zeroing (see below), exceeds this threshold to the right.
+BEND_THRESHOLD = 0.8       # only for fixed and level mode
 BEND_DIRECTION = 1         # flip to -1 if the circle fires on LEFT bends
+
+# --- baseline re-zeroing -------------------------------------------------
+# The tracked tail_sum often rests at a non-zero value (e.g. 0.17 rad) depending
+# on how the tail start point / tip are placed, so one side sits closer to the
+# threshold than the other. This subtracts the resting offset before the
+# threshold is applied, so both sides are equally far from rest. Detection uses
+# (tail_sum - baseline); the raw tail_sum is still logged, and `baseline` is
+# saved as its own column so plot_session can draw the re-zeroed thresholds.
+#   "off"     : no correction (default; identical to before).
+#   "fixed"   : subtract BASELINE_OFFSET, a value you read off a session plot.
+#   "start"   : auto - average the first BASELINE_WINDOW_S s (fish at rest just
+#               after you press record), then hold that offset for the session.
+#   "running" : auto - moving average over the last BASELINE_WINDOW_S s; tracks
+#               slow drift (fast beats average out). Slowly absorbs a sustained
+#               one-sided hold, by design.
+BASELINE_MODE = "start"
+BASELINE_OFFSET = 0.0      # ("fixed") resting tail_sum to subtract, e.g. 0.17
+BASELINE_WINDOW_S = 1.0    # ("start"/"running") averaging window (seconds)
 
 # --- pulse config --------------------------------------------------------
 # "level"      = output is HIGH the whole time tail_sum is over threshold and
@@ -97,20 +116,29 @@ BEND_DIRECTION = 1         # flip to -1 if the circle fires on LEFT bends
 #                through FIRE_LEVEL (0 = neutral) - i.e. BEFORE the tail has
 #                bent to the trigger side. Cancels the stimulation delay/jitter
 #                caused by waiting for a fast beat to reach the trigger side.
-PULSE_MODE = "level"
-PULSE_WIDTH_S = 0.005      # (fixed/predictive) electrical pulse width, 5 ms
-REFRACTORY_S = 0.1         # (fixed) min 100 ms between pulses
+PULSE_MODE = "predictive"
+PULSE_WIDTH_S = 0.01      # (fixed/predictive) electrical pulse width, 5 ms
+REFRACTORY_S = 0.01         # (fixed) min 100 ms between pulses
 CIRCLE_DISPLAY_S = 0.1     # keep the circle visible this long after a pulse
+
+# (fixed/predictive only) Delay the pulse a fixed time AFTER the trigger
+# condition is detected. This decouples DETECTION from STIMULATION timing: pick
+# BEND_THRESHOLD / the predictive levels purely for reliable, low-jitter
+# detection, then use this knob to place the stimulation at any phase of a later
+# beat cycle (0.0 = fire immediately, as before). The delay is applied on the
+# stimulus clock, so the saved logs (and plot_session) show the pulse at its
+# real, delayed time. Ignored in "level" mode.
+STIM_DELAY_S = 0.1
 
 # --- predictive-mode config (only used when PULSE_MODE = "predictive") ----
 # How far to the OPPOSITE side (radians) the tail must bend to count as a real
 # beat and arm the trigger. Set near your typical opposite-bend peak.
-OPPOSITE_THRESHOLD = 1.0
+OPPOSITE_THRESHOLD = 0.45
 # Where on the return stroke to fire: the oriented tail_sum level whose upward
 # crossing emits the pulse. 0.0 = fire at the neutral crossing; NEGATIVE fires
 # earlier (still on the opposite side); positive fires slightly later. This is
 # the "how far after the other-side bend to stimulate" knob.
-FIRE_LEVEL = 0.0
+FIRE_LEVEL = -0.4       #only for predictive
 
 # --- latency config ------------------------------------------------------
 # stytra drains freshly-tracked frames into the accumulator (which the trigger
@@ -155,7 +183,7 @@ AUTO_START_DELAY_S = 3.0
 #          ~/stytra_last_config.json on exit and applies it at startup). Use
 #          this once you have adjusted the tail points in the GUI and want to
 #          keep them run to run.
-PARAMS_SOURCE = "file"
+PARAMS_SOURCE = "last"
 
 
 class RightBendClosedLoop(Protocol):
@@ -195,6 +223,10 @@ class RightBendClosedLoop(Protocol):
                 pulse_mode=PULSE_MODE,
                 pulse_width_s=PULSE_WIDTH_S,
                 refractory_s=REFRACTORY_S,
+                stim_delay_s=STIM_DELAY_S,
+                baseline_mode=BASELINE_MODE,
+                baseline_offset=BASELINE_OFFSET,
+                baseline_window_s=BASELINE_WINDOW_S,
                 opposite_threshold=OPPOSITE_THRESHOLD,
                 fire_level=FIRE_LEVEL,
                 circle_display_s=CIRCLE_DISPLAY_S,

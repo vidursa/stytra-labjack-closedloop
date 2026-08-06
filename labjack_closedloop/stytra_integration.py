@@ -28,6 +28,8 @@ from bend_trigger import (
     RightBendDetector,
     FixedWidthPulseController,
     PredictiveBendController,
+    DelayLine,
+    BaselineTracker,
 )
 
 
@@ -75,6 +77,12 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
       for a fast beat to reach the trigger-side threshold. See
       :class:`PredictiveBendController`.
 
+    In ``fixed`` and ``predictive`` modes an optional ``stim_delay_s`` postpones
+    the pulse a fixed time AFTER the trigger condition is met (see
+    :class:`DelayLine`): pick the detection threshold purely for reliable timing,
+    then dial the delay to place the stimulation at any phase of the beat cycle.
+    ``level`` mode ignores it (its output simply follows the bend).
+
     Parameters
     ----------
     labjack : LabJackU3Output
@@ -86,8 +94,21 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
     pulse_mode : {"fixed", "level", "predictive"}
     pulse_width_s : float
         Electrical pulse width for fixed/predictive modes (default 0.005 = 5 ms).
+        Also the width for which ``output_v`` is logged high, so the stimulus log
+        reflects the true stimulation duration.
     refractory_s : float
         Minimum time between fixed-mode pulses (default 0.1 = 100 ms).
+    stim_delay_s : float
+        (fixed/predictive) delay from detection to the pulse, in seconds
+        (default 0.0 = fire immediately).
+    baseline_mode : {"off", "fixed", "start", "running"}
+        Re-zero the resting ``tail_sum`` before the threshold is applied so both
+        sides are equally far from rest (see :class:`BaselineTracker`). ``"off"``
+        (default) keeps the raw value. All modes apply to fixed/level/predictive.
+    baseline_offset : float
+        (``baseline_mode="fixed"``) constant resting offset to subtract, radians.
+    baseline_window_s : float
+        (``"start"``/``"running"``) averaging window for the baseline, seconds.
     opposite_threshold : float
         (predictive) opposite-side excursion (radians) needed to arm a beat.
     fire_level : float
@@ -110,6 +131,10 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         pulse_mode="fixed",
         pulse_width_s=0.005,
         refractory_s=0.1,
+        stim_delay_s=0.0,
+        baseline_mode="off",
+        baseline_offset=0.0,
+        baseline_window_s=2.0,
         opposite_threshold=1.0,
         fire_level=0.0,
         circle_display_s=0.1,
@@ -121,7 +146,7 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
     ):
         super().__init__(
             *args,
-            dynamic_parameters=["tail_sum", "triggered", "output_v", "pulse"],
+            dynamic_parameters=["tail_sum", "baseline", "triggered", "output_v", "pulse"],
             **kwargs
         )
         # Private (leading underscore) so they are excluded from get_state()
@@ -140,6 +165,17 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
             refractory_s=min(refractory_s, 0.05),
             pulse_width_s=pulse_width_s,
         )
+        # Postpones the emitted pulse a fixed time after the trigger condition is
+        # met (fixed/predictive only). 0.0 -> fire immediately on detection.
+        self._delay = DelayLine(stim_delay_s)
+        # Time of the last actually-emitted pulse (post-delay), used to hold the
+        # output/circle high for the real pulse width in the logs.
+        self._last_emit_t = None
+        # Estimates the resting tail_sum so the threshold is applied symmetrically
+        # (see BaselineTracker). Detection uses tail_sum - baseline.
+        self._baseline = BaselineTracker(
+            mode=baseline_mode, offset=baseline_offset, window_s=baseline_window_s
+        )
 
         # Recorded as static metadata of the stimulus:
         self.threshold = float(threshold)
@@ -147,6 +183,10 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         self.pulse_mode = pulse_mode
         self.pulse_width_s = float(pulse_width_s)
         self.refractory_s = float(refractory_s)
+        self.stim_delay_s = float(stim_delay_s)
+        self.baseline_mode = baseline_mode
+        self.baseline_offset = float(baseline_offset)
+        self.baseline_window_s = float(baseline_window_s)
         self.opposite_threshold = float(opposite_threshold)
         self.fire_level = float(fire_level)
         self.circle_display_s = float(circle_display_s)
@@ -165,6 +205,7 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
 
         # Dynamic (per-frame logged) state:
         self.tail_sum = 0.0
+        self.baseline = 0.0  # current resting-offset estimate (0 when mode="off")
         self.triggered = 0   # circle / output-active state
         self.output_v = 0.0
         self.pulse = 0       # 1 only on the exact frame a pulse fires
@@ -204,6 +245,9 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         super().start()
         self._pulser.reset()
         self._predictor.reset()
+        self._delay.reset()
+        self._baseline.reset()
+        self._last_emit_t = None
         self._prev_active = False
         self._peak_signed = float("-inf")
         self._n_over = 0
@@ -232,17 +276,35 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
                         self._detector.direction,
                     )
                 )
+            if self.stim_delay_s > 0 and self.pulse_mode != "level":
+                print("[trigger] stimulation delayed {:.0f} ms after detection".format(
+                    self.stim_delay_s * 1000))
+            if self.baseline_mode == "fixed":
+                print("[trigger] baseline: fixed re-zero of {:+.3f} rad".format(
+                    self.baseline_offset))
+            elif self.baseline_mode in ("start", "running"):
+                print("[trigger] baseline: {} re-zero over a {:.1f}s window "
+                      "(threshold applied to tail_sum - baseline)".format(
+                          self.baseline_mode, self.baseline_window_s))
 
     def update(self):
         super().update()
         val = self._experiment.estimator.get_tail_sum()  # radians, may be nan
         self.tail_sum = 0.0 if val != val else float(val)
-        over = self._detector.is_triggered(val)
+
+        # Re-zero to the resting position: estimate the baseline offset and apply
+        # the threshold to (tail_sum - baseline), so both sides are equally far
+        # from rest. baseline is 0.0 when baseline_mode="off" (unchanged). We keep
+        # self.tail_sum RAW (matches the behavior log) and log baseline separately.
+        self.baseline = self._baseline.update(self._elapsed, val)
+        corrected = val - self.baseline if val == val else val  # keep nan as nan
+
+        over = self._detector.is_triggered(corrected)
         self.pulse = 0
 
-        # Track the tail_sum range this threshold is applied to (oriented so
-        # positive == the trigger direction) for the end-of-session summary.
-        signed = self._detector.signed(self.tail_sum)
+        # Track the corrected tail_sum range the threshold is applied to (oriented
+        # so positive == the trigger direction) for the end-of-session summary.
+        signed = self._detector.signed(0.0 if corrected != corrected else corrected)
         self._n_frames += 1
         if over:
             self._n_over += 1
@@ -257,30 +319,40 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
             if self._labjack is not None:
                 self._labjack.set_high() if over else self._labjack.set_low()
             self.output_v = self._nominal_v if over else 0.0
-        elif self.pulse_mode == "predictive":
-            # Anticipatory: fire as the tail swings back from the opposite side
-            # up through fire_level (default neutral), i.e. BEFORE it bends to
-            # the trigger side - cancels the delay/jitter of a fast beat. Pass
-            # the oriented value (nan when tracking is lost, so the state holds).
-            signed_val = self._detector.signed(val)
-            fired = self._predictor.step(self._elapsed, signed_val)
-            if fired:
-                self.pulse = 1
-                self._emit_pulse()  # non-blocking
-            active = self._predictor.is_pulse_active(
-                self._elapsed, window_s=self.circle_display_s
-            )
-            self.output_v = self._nominal_v if fired else 0.0
         else:
-            # "fixed": one pulse per rising edge of the right-bend, rate-limited.
-            fired = self._pulser.step(self._elapsed, over)
-            if fired:
+            # fixed / predictive: decide whether the trigger condition is met on
+            # THIS frame, then let the DelayLine postpone the actual pulse by
+            # stim_delay_s (0 -> same-frame). Detection and emission run on the
+            # same _elapsed clock, so the logged pulse time already includes the
+            # delay and lines up with the tail trace.
+            if self.pulse_mode == "predictive":
+                # Anticipatory: fire as the tail swings back from the opposite
+                # side up through fire_level (default neutral). Pass the oriented
+                # RE-ZEROED value (nan when tracking is lost, so the state holds).
+                detected = self._predictor.step(self._elapsed, self._detector.signed(corrected))
+            else:
+                # "fixed": one detection per rising edge of the bend, rate-limited.
+                detected = self._pulser.step(self._elapsed, over)
+
+            if detected:
+                self._delay.push(self._elapsed)
+            if self._delay.pop_due(self._elapsed):
                 self.pulse = 1
+                self._last_emit_t = self._elapsed
                 self._emit_pulse()  # non-blocking
-            active = self._pulser.is_pulse_active(
-                self._elapsed, window_s=self.circle_display_s
-            )
-            self.output_v = self._nominal_v if fired else 0.0
+
+            # Hold output_v high for the whole pulse width (not just the single
+            # fire frame) so the stimulus log shows the REAL stimulation duration
+            # - a 30 ms vs 150 ms pulse now differ in the log - and the circle
+            # follows circle_display_s. Both are measured from the (delayed)
+            # emit time.
+            if self._last_emit_t is None:
+                active = False
+                self.output_v = 0.0
+            else:
+                since = self._elapsed - self._last_emit_t
+                self.output_v = self._nominal_v if since < self.pulse_width_s else 0.0
+                active = since < self.circle_display_s
 
         self.triggered = 1 if active else 0
 

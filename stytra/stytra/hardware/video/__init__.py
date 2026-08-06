@@ -226,8 +226,13 @@ class CameraSource(VideoSource):
                         region= None
                         
                         self.frame_recorder = BufferVideoWriter(
-                            input_queue=self.ring_buffer.get_all(), 
-                            meta_queue=self.ring_buffer.get_all_meta())
+                            input_queue=self.ring_buffer.get_all(),
+                            meta_queue=self.ring_buffer.get_all_meta(),
+                            # Stamp the saved buffer video with the camera's
+                            # actual framerate (the "Framerate (Hz)" GUI control,
+                            # default 200) instead of a hardcoded class default,
+                            # so playback speed is correct.
+                            output_framerate=int(round(self.state.framerate)))
     
                         p = Path()
                         self.current_timestamp = datetime.datetime.now()

@@ -84,12 +84,25 @@ stored in git), are in **[`SETUP.md`](SETUP.md)**.
 
 ## Why stytra is vendored
 
-`stytra/` is an **unmodified** copy of stytra 0.8.34 (verified byte-identical to
-its upstream release). It is included in the repo so that a fresh machine gets
-exactly the version this project was built against — stytra pins to old
-`numba` / `PyQt5`, and installing the matching release from PyPI on a modern
-interpreter is fragile. `pip install -e ./stytra` uses this copy directly. All of
-the closed-loop code is purely *additive*; nothing inside `stytra/` is patched.
+`stytra/` is a copy of stytra 0.8.34, included in the repo so that a fresh
+machine gets exactly the version this project was built against — stytra pins to
+old `numba` / `PyQt5`, and installing the matching release from PyPI on a modern
+interpreter is fragile. `pip install -e ./stytra` uses this copy directly.
+
+**Two intentional patches** fix the saved-video framerate (everything else is
+untouched). stytra has two recording paths and each dropped the framerate:
+
+- `stytra/stytra/experiments/tracking_experiments.py` — the **protocol recording**
+  path (`StreamingVideoWriter`, used when you press ▶). `_setup_recording()` now
+  forwards `output_framerate` from the protocol's `recording` config, so
+  `CAMERA_FPS` in `run_experiment.py` sets the real playback rate. Upstream
+  dropped it and defaulted to 24 fps, so a 200 fps clip played back ~8× slow.
+- `stytra/stytra/hardware/video/__init__.py` — the **ring-buffer save** path
+  (`BufferVideoWriter`, the "save buffer" feature). Now stamps the video with the
+  camera's actual framerate (the *Framerate (Hz)* GUI control) instead of a
+  hardcoded class default.
+
+All of the closed-loop code under `labjack_closedloop/` is purely *additive*.
 
 ## Licensing
 

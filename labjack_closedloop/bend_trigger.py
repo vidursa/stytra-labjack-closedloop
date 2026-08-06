@@ -15,6 +15,7 @@ Its sign encodes the direction of the bend (left vs. right). We treat this value
 """
 
 import math
+from collections import deque
 
 
 def tail_sum_to_degrees(tail_sum_rad):
@@ -24,6 +25,94 @@ def tail_sum_to_degrees(tail_sum_rad):
 
 def _is_nan(x):
     return x is None or x != x
+
+
+class BaselineTracker:
+    """Estimate the tail's *resting* ``tail_sum`` so the threshold sits symmetrically.
+
+    Tail tracking often rests at a non-zero ``tail_sum`` (e.g. 0.17 rad) depending
+    on how the start point / tip are placed, which makes one side closer to the
+    threshold than the other. This estimates that resting offset ``b`` so the
+    detector can test the *re-zeroed* value ``tail_sum - b``: both sides are then
+    equally far from rest before the threshold is applied.
+
+    Modes
+    -----
+    ``"off"``
+        No correction; the baseline is always 0 (identical to before).
+    ``"fixed"``
+        Constant, user-supplied ``offset`` (read it straight off a session plot).
+    ``"start"``
+        Average the first ``window_s`` seconds of tracked values (the fish is
+        assumed to be at rest just after you press record), then hold that offset
+        for the rest of the session. While still collecting it returns the
+        running mean so far, so early frames are already roughly corrected.
+    ``"running"``
+        Moving average over the last ``window_s`` seconds, updated every frame:
+        slow drift is tracked while the fast (~12 Hz) beats average out. Note it
+        will slowly absorb a *sustained* one-sided hold, by design ("re-zero the
+        default position").
+
+    ``update(t, raw)`` returns the current baseline. ``nan`` inputs (tracking
+    lost) hold the current estimate without disturbing it.
+
+    Parameters
+    ----------
+    mode : {"off", "fixed", "start", "running"}
+    offset : float
+        The constant offset for ``"fixed"`` mode (radians).
+    window_s : float
+        Averaging window for ``"start"`` / ``"running"`` modes (seconds).
+    """
+
+    def __init__(self, mode="off", offset=0.0, window_s=2.0):
+        self.mode = mode
+        self.offset = float(offset)
+        self.window_s = float(window_s)
+        self.reset()
+
+    def reset(self):
+        self._samples = deque()  # (t, value) for the windowed modes
+        self._sum = 0.0
+        self._value = self.offset if self.mode == "fixed" else 0.0
+        self._frozen = False  # "start": True once the window has been averaged
+
+    @property
+    def value(self):
+        """The current baseline estimate (radians)."""
+        return self._value
+
+    @property
+    def frozen(self):
+        """True once a ``"start"`` baseline has been locked in."""
+        return self._frozen
+
+    def update(self, t, raw):
+        """Advance one frame with the raw ``tail_sum`` and return the baseline."""
+        if self.mode == "off":
+            return 0.0
+        if self.mode == "fixed":
+            return self.offset
+        if raw is None or raw != raw:  # nan: hold the current estimate
+            return self._value
+
+        if self.mode == "start":
+            if not self._frozen:
+                self._samples.append((t, raw))
+                self._sum += raw
+                self._value = self._sum / len(self._samples)  # provisional mean
+                if (t - self._samples[0][0]) >= self.window_s:
+                    self._frozen = True  # lock the offset for the rest of the run
+            return self._value
+
+        # "running": moving average over the last window_s (O(1) amortised).
+        self._samples.append((t, raw))
+        self._sum += raw
+        while self._samples and (t - self._samples[0][0]) > self.window_s:
+            _, old = self._samples.popleft()
+            self._sum -= old
+        self._value = self._sum / len(self._samples) if self._samples else 0.0
+        return self._value
 
 
 class RightBendDetector:
@@ -119,6 +208,60 @@ class FixedWidthPulseController:
             return False
         window = self.pulse_width_s if window_s is None else window_s
         return (t - self.last_onset) < window
+
+
+class DelayLine:
+    """Postpone fire events by a fixed time, on the controller's own clock.
+
+    A detector/controller decides *when the trigger condition is met*; this
+    postpones the actual pulse by ``delay_s`` so the stimulation lands a chosen
+    time after detection (e.g. a fixed offset into a later phase of the tail-beat
+    cycle). Detection and emission share the same monotonic ``t`` (the stimulus
+    ``_elapsed`` clock), so the delayed pulse is logged on the same time axis as
+    the tail trace and everything else.
+
+    Usage each frame::
+
+        if controller_fired:
+            delay.push(t)          # schedule a pulse for t + delay_s
+        if delay.pop_due(t):       # has any scheduled pulse's time arrived?
+            emit_pulse()
+
+    With ``delay_s == 0`` a pushed pulse is immediately due on the same frame, so
+    the behaviour is identical to firing on detection (backwards compatible).
+
+    A constant delay preserves the spacing of detections, so scheduled pulses
+    never bunch up: at most one comes due per frame.
+
+    Parameters
+    ----------
+    delay_s : float
+        Seconds to wait between detection and the pulse (>= 0).
+    """
+
+    def __init__(self, delay_s=0.0):
+        self.delay_s = max(0.0, float(delay_s))
+        self._pending = []  # emit times, ascending
+
+    def reset(self):
+        self._pending = []
+
+    @property
+    def pending(self):
+        """How many scheduled pulses have not yet come due."""
+        return len(self._pending)
+
+    def push(self, t):
+        """Schedule a pulse for ``t + delay_s``."""
+        self._pending.append(float(t) + self.delay_s)
+
+    def pop_due(self, t):
+        """Remove and count the scheduled pulses whose time has arrived by ``t``."""
+        n = 0
+        while self._pending and self._pending[0] <= t:
+            self._pending.pop(0)
+            n += 1
+        return n
 
 
 class PredictiveBendController:

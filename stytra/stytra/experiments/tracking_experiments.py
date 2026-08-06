@@ -97,6 +97,11 @@ class CameraVisualExperiment(VisualExperiment):
             self._setup_recording(
                 kbit_framerate=recording.get("kbit_rate", 1000),
                 extension=recording["extension"],
+                # Forward the acquisition rate so the saved .mp4 is stamped with
+                # the camera's true framerate. Without this the writer falls back
+                # to StreamingVideoWriter's 24 fps default and a 200 fps clip
+                # plays back ~8x too slow.
+                output_framerate=recording.get("output_framerate", 24),
             )
 
     def reset(self) -> None:
@@ -179,7 +184,10 @@ class CameraVisualExperiment(VisualExperiment):
         )
 
     def _setup_recording(
-        self, kbit_framerate: int = 1000, extension: str = "mp4"
+        self,
+        kbit_framerate: int = 1000,
+        extension: str = "mp4",
+        output_framerate: int = 24,
     ) -> None:
         """
         Does the necessary setup before performing the recording, such as creating events, setting up the dispatcher
@@ -191,6 +199,9 @@ class CameraVisualExperiment(VisualExperiment):
             the byte rate at which the video is encoded.
         extension
             the extension used at the end of the video file.
+        output_framerate
+            framerate stamped into the saved video (should match the acquisition
+            rate, else playback speed is wrong).
         """
         self.recording_event = Event()
         self.reset_event = Event()
@@ -214,6 +225,7 @@ class CameraVisualExperiment(VisualExperiment):
                 reset_event=self.reset_event,
                 finish_event=self.finish_event,
                 kbit_rate=kbit_framerate,
+                output_framerate=output_framerate,
                 log_format=self.log_format,
             )
 

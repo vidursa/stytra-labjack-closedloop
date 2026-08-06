@@ -18,6 +18,7 @@ Usage:
     python plot_session.py                        # newest session under ../recordings
     python plot_session.py ../recordings/simulated
     python plot_session.py path/to/session_dir    # threshold taken from metadata
+    python plot_session.py path/to/session_dir/<prefix>_behavior_log.csv
     python plot_session.py <dir> --threshold 1.0 --direction 1   # override
     python plot_session.py <dir> --save out.png --no-show
 
@@ -85,6 +86,47 @@ def pulse_onsets(stim):
     return [t for t, p in zip(stim[tc], stim[pc]) if p >= 0.5]
 
 
+def baseline_series(stim):
+    """(times, baseline_values) from the stimulus log's ``baseline`` column.
+
+    Returns ``(None, None)`` if there is no baseline column (older logs, or
+    baseline_mode="off" won't be drawn since it is all-zero)."""
+    if stim is None:
+        return None, None
+    tc = time_col(stim)
+    bc = col_by_suffix(stim, "baseline")
+    if not tc or not bc:
+        return None, None
+    return stim[tc], stim[bc]
+
+
+def active_intervals(stim):
+    """(start, end) spans during which the output was actually high.
+
+    Read from ``output_v`` (volts; falls back to the ``triggered`` flag), so it
+    shows the REAL stimulation duration - a 30 ms vs a 150 ms pulse now differ -
+    and, with a stimulation delay, the span sits at the delayed pulse time rather
+    than at the detection instant. Uses the step-post convention: a span runs
+    from the sample the output goes high up to the sample it drops back to 0."""
+    tc = time_col(stim)
+    vc = col_by_suffix(stim, "output_v") or col_by_suffix(stim, "triggered")
+    if not tc or not vc:
+        return []
+    ts, vs = stim[tc], stim[vc]
+    intervals = []
+    start = None
+    for t, v in zip(ts, vs):
+        on = (v == v) and (v > 1e-9)  # NaN-safe; output_v is 0 or ~volts
+        if on and start is None:
+            start = t
+        elif (not on) and start is not None:
+            intervals.append((start, t))
+            start = None
+    if start is not None and ts:
+        intervals.append((start, ts[-1]))
+    return intervals
+
+
 # ----------------------------------------------------------------------
 # session discovery
 # ----------------------------------------------------------------------
@@ -95,13 +137,35 @@ def _latest(globbed):
     return max(files, key=os.path.getmtime)
 
 
+def _session_prefix(p):
+    """The filename prefix shared by one session's logs.
+
+    e.g. ``'161011_'`` from ``161011_behavior_log.csv``. Returns ``''`` for a
+    directory or a file with no recognisable prefix, which means "no specific
+    session - take the newest in the folder"."""
+    if not p.is_file():
+        return ""
+    name = p.name
+    for tag in ("behavior_log", "stimulus_log", "estimator_log", "metadata"):
+        i = name.find(tag)
+        if i > 0:
+            return name[:i]
+    return ""
+
+
 def find_logs(path):
-    """Return (behavior_csv, stimulus_csv, session_dir) for a dir or a file."""
+    """Return (behavior_csv, stimulus_csv, session_dir, prefix) for a dir/file.
+
+    Passing a directory (or an unprefixed file) selects the NEWEST logs in that
+    folder. Passing a specific ``<prefix>_behavior_log.csv`` pins the plot to
+    THAT session: the stimulus log (and, via the prefix, the metadata) are
+    matched by the same ``<prefix>`` rather than by newest-modified."""
     p = Path(path)
     d = p.parent if p.is_file() else p
-    beh = _latest(d.glob("*behavior_log*.csv"))
-    stim = _latest(d.glob("*stimulus_log*.csv"))
-    return beh, stim, d
+    prefix = _session_prefix(p)
+    beh = _latest(d.glob(prefix + "*behavior_log*.csv"))
+    stim = _latest(d.glob(prefix + "*stimulus_log*.csv"))
+    return beh, stim, d, prefix
 
 
 def default_session():
@@ -131,7 +195,7 @@ def _search_stim_state(obj):
     return None
 
 
-def stim_params_from_metadata(session_dir):
+def stim_params_from_metadata(session_dir, prefix=""):
     """Read the trigger parameters actually used from ``*_metadata.json``.
 
     stytra records each stimulus's static params (``threshold``, ``direction``,
@@ -139,7 +203,7 @@ def stim_params_from_metadata(session_dir):
     ``stimulus/log``, so the plot can show the values that were really in force
     instead of hard-coded guesses. Returns ``{}`` when there is no metadata
     (e.g. the offline-simulated logs)."""
-    meta = _latest(Path(session_dir).glob("*metadata*.json"))
+    meta = _latest(Path(session_dir).glob(prefix + "*metadata*.json"))
     if meta is None:
         return {}
     try:
@@ -175,6 +239,7 @@ def plot(behavior, stimulus, threshold, direction, out_path, show,
         raise SystemExit("Could not find 't' and 'tail_sum' columns in the logs.")
 
     onsets = pulse_onsets(stimulus) if stimulus is not None else []
+    spans = active_intervals(stimulus) if stimulus is not None else []
     active_thr = direction * threshold
     predictive = (pulse_mode == "predictive")
 
@@ -184,42 +249,74 @@ def plot(behavior, stimulus, threshold, direction, out_path, show,
 
     ax1.plot(ts_src[tcol], ts_src[scol], lw=0.8, color="#1f77b4", label="tail_sum")
 
+    # Decision levels are applied to the RE-ZEROED signal (tail_sum - baseline).
+    # If a baseline was used they must be drawn relative to that resting level so
+    # they line up with the raw trace: each level L becomes baseline(t) + L. When
+    # the baseline is off (all-zero) we draw plain horizontal lines as before.
+    bt, bvals = baseline_series(stimulus)
+    baseline_on = bvals is not None and any(
+        (b == b) and abs(b) > 1e-9 for b in bvals
+    )
+
+    def _level_line(offset, **kw):
+        """Draw a decision level: a curve baseline(t)+offset if re-zeroed, else
+        a flat axhline at offset."""
+        if baseline_on:
+            ax1.plot(bt, [(b if b == b else 0.0) + offset for b in bvals], **kw)
+        else:
+            kw.pop("drawstyle", None)
+            ax1.axhline(offset, **kw)
+
+    if baseline_on:
+        # The resting level itself (replaces the neutral 0 line): the trace now
+        # beats around THIS, and the thresholds are symmetric about it.
+        ax1.plot(bt, bvals, ls="-", color="0.5", lw=1.0, label="baseline (rest)")
+        # Symmetric opposite-side reference, so "equally distant" is visible.
+        _level_line(-active_thr, ls="--", color="0.7", lw=0.8,
+                    label="- threshold (symmetric)")
+    else:
+        ax1.axhline(0.0, ls="-", color="0.7", lw=0.6)
+
     # The trigger-side threshold. In predictive mode it is NOT what fires the
     # pulse, so draw it faintly to avoid implying otherwise.
-    ax1.axhline(
+    _level_line(
         active_thr,
         ls=":" if predictive else "--",
         color="0.55" if predictive else "crimson",
         lw=1.0 if predictive else 1.2,
-        label="threshold = {:g}{}".format(
-            active_thr, " (unused in predictive)" if predictive else ""),
+        label="threshold = {:g}{}{}".format(
+            active_thr,
+            " + baseline" if baseline_on else "",
+            " (unused in predictive)" if predictive else ""),
     )
 
     # Predictive mode fires off two OTHER levels, both defined on the oriented
-    # signal (direction * tail_sum). Convert them back into raw tail_sum
-    # coordinates so they sit correctly on this trace:
-    #   arm  : oriented <= -opposite_threshold  ->  tail_sum = -direction*opp
-    #   fire : oriented crosses up through fire_level -> tail_sum = direction*fire
+    # RE-ZEROED signal (direction * (tail_sum - baseline)). Convert them back
+    # into raw tail_sum coordinates (add baseline via _level_line):
+    #   arm  : oriented <= -opposite_threshold  ->  offset = -direction*opp
+    #   fire : oriented crosses up through fire_level -> offset = direction*fire
     if predictive and opposite_threshold is not None:
-        ax1.axhline(
+        _level_line(
             -direction * opposite_threshold,
-            ls="--",
-            color="seagreen",
-            lw=1.3,
+            ls="--", color="seagreen", lw=1.3,
             label="opposite bend (arm) = {:g}".format(-direction * opposite_threshold),
         )
     if predictive and fire_level is not None:
-        ax1.axhline(
+        _level_line(
             direction * fire_level,
-            ls="-.",
-            color="crimson",
-            lw=1.3,
+            ls="-.", color="crimson", lw=1.3,
             label="fire level = {:g}".format(direction * fire_level),
         )
-
-    ax1.axhline(0.0, ls="-", color="0.7", lw=0.6)
+    # Shade the real stimulation spans (width = pulse duration, position = the
+    # delayed pulse time). Fall back to thin onset lines if the output column is
+    # missing or a span collapses to a single sample (sub-frame pulse).
+    if spans:
+        for i, (a, b) in enumerate(spans):
+            ax1.axvspan(a, b, color="crimson", alpha=0.25,
+                        label="stimulation" if i == 0 else None)
     for i, t in enumerate(onsets):
-        ax1.axvline(t, color="crimson", alpha=0.30, lw=1.0, label="pulse" if i == 0 else None)
+        ax1.axvline(t, color="crimson", alpha=0.30, lw=1.0,
+                    label=("pulse" if (i == 0 and not spans) else None))
     ax1.set_ylabel("tail_sum (rad)")
     if predictive:
         title = "Closed-loop session (predictive) — {} pulses: arm past {:g}, fire crossing {:g}".format(
@@ -245,6 +342,8 @@ def plot(behavior, stimulus, threshold, direction, out_path, show,
         elif tr:
             ax2.plot(stimulus[st], stimulus[tr], drawstyle="steps-post", color="darkorange")
             ax2.set_ylabel("triggered")
+        for a, b in spans:
+            ax2.axvspan(a, b, color="crimson", alpha=0.15)
     ax2.set_xlabel("time (s)")
 
     fig.tight_layout()
@@ -294,7 +393,7 @@ def main():
             "simulate_tracking.py first.".format(RECORDINGS)
         )
 
-    beh, stim, sdir = find_logs(session)
+    beh, stim, sdir, prefix = find_logs(session)
     if beh is None and stim is None:
         raise SystemExit("No *_behavior_log.csv / *_stimulus_log.csv in {}".format(sdir))
     print("Session dir : {}".format(sdir))
@@ -303,7 +402,7 @@ def main():
 
     # Threshold/direction: CLI override wins, else the value saved in the
     # session metadata, else a last-resort default (e.g. simulated logs).
-    meta = stim_params_from_metadata(sdir)
+    meta = stim_params_from_metadata(sdir, prefix)
     meta_thr = _meta_float(meta, "threshold")
     _raw_dir = _meta_float(meta, "direction")
     meta_dir = None if _raw_dir is None else (1 if _raw_dir >= 0 else -1)
@@ -335,6 +434,20 @@ def main():
         else _meta_float(meta, "fire_level")
     )
     print("Pulse mode  : {}".format(pulse_mode or "unknown (no metadata)"))
+    pulse_width_s = _meta_float(meta, "pulse_width_s")
+    stim_delay_s = _meta_float(meta, "stim_delay_s")
+    if pulse_width_s is not None and pulse_mode != "level":
+        print("Pulse width : {:.0f} ms".format(pulse_width_s * 1000))
+    if stim_delay_s:  # non-zero, non-None
+        print("Stim delay  : {:.0f} ms after detection".format(stim_delay_s * 1000))
+    baseline_mode = meta.get("baseline_mode")
+    if baseline_mode and baseline_mode != "off":
+        note = ""
+        if baseline_mode == "fixed":
+            bo = _meta_float(meta, "baseline_offset")
+            note = " (offset {:+.3f} rad)".format(bo) if bo is not None else ""
+        print("Baseline    : {} re-zero{}  [threshold applied to tail_sum - baseline]".format(
+            baseline_mode, note))
     if pulse_mode == "predictive":
         print("Predictive  : arm at tail_sum {:g}, fire at tail_sum {:g}".format(
             -direction * (opposite_threshold if opposite_threshold is not None else float("nan")),
