@@ -209,6 +209,7 @@ Overlay the `tail_sum` trace with the pulse markers (works on real or simulated 
 ```bash
 python plot_session.py                       # newest session under ../recordings
 python plot_session.py ../recordings/simulated
+python plot_session.py path/to/session_dir/<prefix>_behavior_log.csv  # plot a specific session
 python plot_session.py <session_dir> --threshold 1.0 --direction 1
 python plot_session.py <session_dir> --save out.png --no-show   # headless
 ```
