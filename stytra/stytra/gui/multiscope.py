@@ -120,6 +120,16 @@ class MultiStreamPlot(QWidget):
 
         self.layout().addWidget(self.plotContainer)
 
+        # Red vertical marker at the moment recording/protocol started. It is
+        # repositioned every update() to scroll left with the timeline, so it
+        # stays pinned to the frame where the protocol began.
+        self._recording_start_time = None
+        self.recording_line = pg.InfiniteLine(
+            pos=0, angle=90, pen=pg.mkPen((230, 30, 0), width=2)
+        )
+        self.recording_line.setVisible(False)
+        self.plotContainer.addItem(self.recording_line, ignoreBounds=True)
+
         self.active_plots = []
 
         self.accumulators = accumulators or []
@@ -304,6 +314,13 @@ class MultiStreamPlot(QWidget):
 
         current_time = datetime.datetime.now()
 
+        # Keep the recording-start marker pinned to its frame as the plot scrolls
+        # (x = 0 is "now", negative is the past).
+        if self._recording_start_time is not None:
+            self.recording_line.setValue(
+                (self._recording_start_time - current_time).total_seconds()
+            )
+
         i_stream = 0
         for i_acc, (acc, sel_cols) in enumerate(
             zip(self.accumulators, self.selected_columns)
@@ -413,7 +430,7 @@ class MultiStreamPlot(QWidget):
             xRange=(-self.time_past * 0.9, self.time_past * 0.05)
         )
         # shift the labels
-        for (i_curve, items) in enumerate(self.stream_items):
+        for i_curve, items in enumerate(self.stream_items):
             items.curve_label.setPos(-self.time_past * 0.9, i_curve)
 
     def update_replay_limits(self):
@@ -433,10 +450,19 @@ class MultiStreamPlot(QWidget):
         self.wnd_config = StreamPlotConfig(self)
         self.wnd_config.show()
 
+    def mark_recording_start(self):
+        """Show the red vertical marker at the current moment (protocol start)."""
+        self._recording_start_time = datetime.datetime.now()
+        self.recording_line.setVisible(True)
+
+    def clear_recording_start(self):
+        """Hide the recording-start marker (protocol finished / interrupted)."""
+        self._recording_start_time = None
+        self.recording_line.setVisible(False)
+
 
 class StreamPlotConfig(QWidget):
-    """ Widget for configuring streaming plots
-    """
+    """Widget for configuring streaming plots"""
 
     def __init__(self, sp: MultiStreamPlot):
         super().__init__()
@@ -500,7 +526,7 @@ class FrameratePlot(MultiStreamPlot):
             return rounded
 
     def _update_round_bounds(self, old_bounds, new_bounds, tolerance=0.1):
-        """ If bounds are exceeed by tolerance
+        """If bounds are exceeed by tolerance
 
         Parameters
         ----------

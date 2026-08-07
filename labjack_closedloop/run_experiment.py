@@ -16,7 +16,6 @@ Usage (inside a stytra environment, see README):
     python run_experiment.py
 """
 
-
 import argparse
 import json
 import os
@@ -35,20 +34,19 @@ from stytra_integration import RightBendEstimator, RightBendTriggerStimulus
 REPO_ROOT = Path(__file__).resolve().parent.parent
 VIDEO_FILE = REPO_ROOT / "Basler_acA640-750um__25004149__20260513_144734755.mp4"
 PARAMS_FILE = (
-    REPO_ROOT
-    / "Basler_acA640-750um__25004149__20260513_144734755_trackingparams.json"
+    REPO_ROOT / "Basler_acA640-750um__25004149__20260513_144734755_trackingparams.json"
 )
 SAVE_DIR = REPO_ROOT / "recordings"
 
 # --- hardware config -----------------------------------------------------
 # Set LABJACK_BACKEND = "u3" when a real LabJack U3 is connected (see
 # HARDWARE_GUIDE.md). "simulate" records + prints every transition instead.
-LABJACK_BACKEND = "u3" #""simulate"
+LABJACK_BACKEND = "u3" #"simulate"
 # U3-HV: FIO0-FIO3 are fixed analog inputs, so a digital output must use
 # FIO4-FIO7 (or EIO0-EIO7). FIO4 gives a 3.3 V logic pulse. For a true ~5 V
 # level set LABJACK_CHANNEL = "DAC0" and LABJACK_VOLTAGE = 5.0.
 LABJACK_CHANNEL = "FIO4"
-LABJACK_VOLTAGE = 3.3      # nominal logic-high level (for logging)
+LABJACK_VOLTAGE = 3.3  # nominal logic-high level (for logging)
 
 # --- camera config -------------------------------------------------------
 # Simulation: USE_REAL_CAMERA = False plays the recorded video as if it were a
@@ -74,7 +72,7 @@ CAMERA_FPS = 200
 # Tip: wire the FIO4 output back into one of these analog inputs to get a
 # ground-truth 1 kHz record of the stimulation on the same clock as the cameras.
 RECORD_TTL_STREAM = False
-TTL_STREAM_CHANNELS = (1, 2, 3)          # AIN1, AIN2, AIN3
+TTL_STREAM_CHANNELS = (1, 2, 3)  # AIN1, AIN2, AIN3
 TTL_STREAM_LABELS = ("stim_ttl", "camera_ttl", "behaviourcam_ttl")
 TTL_STREAM_HZ = 1000
 # Leave False on a U3-HV (FIO0-FIO3 are permanently analog). True runs
@@ -84,8 +82,8 @@ TTL_STREAM_CONFIG_ANALOG = False
 # --- trigger config ------------------------------------------------------
 # Trigger when the tail_sum (radians, the value shown in the stytra plot),
 # AFTER baseline re-zeroing (see below), exceeds this threshold to the right.
-BEND_THRESHOLD = 0.8       # only for fixed and level mode
-BEND_DIRECTION = 1         # flip to -1 if the circle fires on LEFT bends
+BEND_THRESHOLD = 0.8  # only for fixed and level mode
+BEND_DIRECTION = 1  # flip to -1 if the circle fires on LEFT bends
 
 # --- baseline re-zeroing -------------------------------------------------
 # The tracked tail_sum often rests at a non-zero value (e.g. 0.17 rad) depending
@@ -102,8 +100,8 @@ BEND_DIRECTION = 1         # flip to -1 if the circle fires on LEFT bends
 #               slow drift (fast beats average out). Slowly absorbs a sustained
 #               one-sided hold, by design.
 BASELINE_MODE = "start"
-BASELINE_OFFSET = 0.0      # ("fixed") resting tail_sum to subtract, e.g. 0.17
-BASELINE_WINDOW_S = 1.0    # ("start"/"running") averaging window (seconds)
+BASELINE_OFFSET = 0.0  # ("fixed") resting tail_sum to subtract, e.g. 0.17
+BASELINE_WINDOW_S = 1.0  # ("start"/"running") averaging window (seconds)
 
 # --- pulse config --------------------------------------------------------
 # "level"      = output is HIGH the whole time tail_sum is over threshold and
@@ -117,9 +115,9 @@ BASELINE_WINDOW_S = 1.0    # ("start"/"running") averaging window (seconds)
 #                bent to the trigger side. Cancels the stimulation delay/jitter
 #                caused by waiting for a fast beat to reach the trigger side.
 PULSE_MODE = "predictive"
-PULSE_WIDTH_S = 0.01      # (fixed/predictive) electrical pulse width, 5 ms
-REFRACTORY_S = 0.01         # (fixed) min 100 ms between pulses
-CIRCLE_DISPLAY_S = 0.1     # keep the circle visible this long after a pulse
+PULSE_WIDTH_S = 0.01  # (fixed/predictive) electrical pulse width, 10 ms
+REFRACTORY_S = 0.01  # (fixed) min gap between pulses (10 ms here)
+CIRCLE_DISPLAY_S = 0.1  # keep the circle visible this long after a pulse
 
 # (fixed/predictive only) Delay the pulse a fixed time AFTER the trigger
 # condition is detected. This decouples DETECTION from STIMULATION timing: pick
@@ -128,7 +126,7 @@ CIRCLE_DISPLAY_S = 0.1     # keep the circle visible this long after a pulse
 # beat cycle (0.0 = fire immediately, as before). The delay is applied on the
 # stimulus clock, so the saved logs (and plot_session) show the pulse at its
 # real, delayed time. Ignored in "level" mode.
-STIM_DELAY_S = 0.1
+STIM_DELAY_S = 0.0
 
 # --- predictive-mode config (only used when PULSE_MODE = "predictive") ----
 # How far to the OPPOSITE side (radians) the tail must bend to count as a real
@@ -138,7 +136,7 @@ OPPOSITE_THRESHOLD = 0.45
 # crossing emits the pulse. 0.0 = fire at the neutral crossing; NEGATIVE fires
 # earlier (still on the opposite side); positive fires slightly later. This is
 # the "how far after the other-side bend to stimulate" knob.
-FIRE_LEVEL = -0.4       #only for predictive
+FIRE_LEVEL = -0.4  # only for predictive
 
 # --- latency config ------------------------------------------------------
 # stytra drains freshly-tracked frames into the accumulator (which the trigger
@@ -193,12 +191,12 @@ class RightBendClosedLoop(Protocol):
         display=dict(full_screen=False),
         tracking=dict(embedded=True, method="tail", estimator=RightBendEstimator),
         # Live camera when USE_REAL_CAMERA, otherwise the recorded video.
-        camera=(dict(REAL_CAMERA) if USE_REAL_CAMERA else dict(video_file=str(VIDEO_FILE))),
+        camera=(
+            dict(REAL_CAMERA) if USE_REAL_CAMERA else dict(video_file=str(VIDEO_FILE))
+        ),
         # output_framerate must match the acquisition rate or the saved .mp4
         # plays back at the wrong speed (see CAMERA_FPS).
-        recording=dict(
-            extension="mp4", kbit_rate=10000, output_framerate=CAMERA_FPS
-        ),
+        recording=dict(extension="mp4", kbit_rate=10000, output_framerate=CAMERA_FPS),
     )
 
     def __init__(self):
@@ -270,26 +268,38 @@ def parse_args(argv=None):
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     ap.add_argument(
-        "-d", "--duration", type=float, default=SESSION_DURATION_S,
+        "-d",
+        "--duration",
+        type=float,
+        default=SESSION_DURATION_S,
         metavar="SECONDS",
         help="total recording time per session",
     )
     ap.add_argument(
-        "--params", choices=("file", "last"), default=PARAMS_SOURCE,
+        "--params",
+        choices=("file", "last"),
+        default=PARAMS_SOURCE,
         help="tracking parameters: load the exported JSON, or keep the ones "
-             "stytra restored from your previous run",
+        "stytra restored from your previous run",
     )
     start = ap.add_mutually_exclusive_group()
     start.add_argument(
-        "--autostart", dest="autostart", action="store_true", default=AUTO_START,
+        "--autostart",
+        dest="autostart",
+        action="store_true",
+        default=AUTO_START,
         help="start recording automatically a few seconds after launch",
     )
     start.add_argument(
-        "--no-autostart", dest="autostart", action="store_false",
+        "--no-autostart",
+        dest="autostart",
+        action="store_false",
         help="wait for the ▶ toggle so you can position the tail points first",
     )
     ap.add_argument(
-        "--ttl-stream", action="store_true", default=RECORD_TTL_STREAM,
+        "--ttl-stream",
+        action="store_true",
+        default=RECORD_TTL_STREAM,
         help="also stream the TTL analog inputs to CSV (needs a real U3)",
     )
     return ap.parse_args(argv)
@@ -314,6 +324,14 @@ def main(argv=None):
     # loop starts, then run the loop ourselves.
     st = Stytra(protocol=protocol, dir_save=str(SAVE_DIR), exec=False)
 
+    # Keep the tail trace plot live DURING the protocol (stytra normally freezes
+    # it at ▶ "so plotting does not interfere with stimulus display"). This shows
+    # the raw tracking tail, the estimator tail_sum, and the stimulus decision
+    # signals (tail_sum/triggered/output_v/pulse) scrolling in real time, plus a
+    # red vertical marker at the moment recording started. If you ever see the
+    # stimulus display stutter on a slow PC, set this back to False.
+    st.exp.keep_plot_live_during_protocol = True
+
     # Apply the saved tail-tracking parameters. Pushing them straight onto the
     # tracking process' parameter queue guarantees the worker adopts them; we
     # also set them on the main-process pipeline so the GUI reflects them.
@@ -327,8 +345,10 @@ def main(argv=None):
     if args.params == "last":
         try:
             st.exp.processing_params_queue.put(st.exp.pipeline.serialize_params())
-            print("Using tracking parameters restored from the previous run "
-                  "(~/stytra_last_config.json); PARAMS_FILE not loaded.")
+            print(
+                "Using tracking parameters restored from the previous run "
+                "(~/stytra_last_config.json); PARAMS_FILE not loaded."
+            )
         except Exception as e:
             print("Could not re-push restored params to the tracking worker:", e)
     elif PARAMS_FILE.exists():
@@ -366,8 +386,11 @@ def main(argv=None):
             ttl_stream.stop()  # no-op if the finished signal already stopped it
             if ttl_stream.samples:
                 path = ttl_stream.save_csv(st.exp.filename_base() + "ttl_stream.csv")
-                print("    TTL stream -> {} ({} scans)".format(
-                    path, len(ttl_stream.samples)))
+                print(
+                    "    TTL stream -> {} ({} scans)".format(
+                        path, len(ttl_stream.samples)
+                    )
+                )
         print("\n=== SESSION SAVED ===")
         print("    logs + video under: {}".format(SAVE_DIR / RightBendClosedLoop.name))
         print("    (press the ▶ toggle again for another run, or close the window)\n")
@@ -382,8 +405,11 @@ def main(argv=None):
     def _boost_poll_rate():
         st.exp.gui_timer.setInterval(POLL_INTERVAL_MS)
         if getattr(st.exp, "acc_tracking", None) is not None:
-            print("[latency] tracking poll raised to {} ms (~{:.0f} Hz)".format(
-                POLL_INTERVAL_MS, 1000.0 / POLL_INTERVAL_MS))
+            print(
+                "[latency] tracking poll raised to {} ms (~{:.0f} Hz)".format(
+                    POLL_INTERVAL_MS, 1000.0 / POLL_INTERVAL_MS
+                )
+            )
 
     if POLL_INTERVAL_MS and POLL_INTERVAL_MS < 16:
         st.exp.protocol_runner.sig_protocol_started.connect(
@@ -421,7 +447,8 @@ def main(argv=None):
             "\nAuto-starting the protocol in {:.0f}s; it records for {:.0f}s then "
             "SAVES automatically.\nWatch for [trigger]/[LabJack] lines below and the "
             "white circle on the stimulus window.\n".format(
-                AUTO_START_DELAY_S, SESSION_DURATION_S)
+                AUTO_START_DELAY_S, SESSION_DURATION_S
+            )
         )
         QTimer.singleShot(int(AUTO_START_DELAY_S * 1000), st.exp.start_protocol)
     else:

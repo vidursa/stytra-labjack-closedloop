@@ -18,7 +18,7 @@ Usage:
     python plot_session.py                        # newest session under ../recordings
     python plot_session.py ../recordings/simulated
     python plot_session.py path/to/session_dir    # threshold taken from metadata
-    python plot_session.py path/to/session_dir/<prefix>_behavior_log.csv
+    python plot_session.py path/to/session_dir/<prefix>_behavior_log.csv    # specific file
     python plot_session.py <dir> --threshold 1.0 --direction 1   # override
     python plot_session.py <dir> --save out.png --no-show
 

@@ -4,7 +4,6 @@ implement video saving
 """
 
 import numpy as np
-import pyautogui
 from multiprocessing import Queue, Event
 from queue import Empty, Full
 from pathlib import Path
@@ -24,15 +23,13 @@ from stytra.hardware.video.ring_buffer import RingBuffer
 import tempfile
 import time
 import datetime
-import os
-
 
 
 class VideoSource(FrameProcess):
     """Abstract class for a process that generates frames, being it a camera
     or a file source. A maximum size of the memory used by the process can be
     set.
-    
+
     **Input Queues:**
 
     self.control_queue :
@@ -76,16 +73,16 @@ class VideoSource(FrameProcess):
         self.n_consumers = 1
         self.state = None
 
-    def put_frame(self, frame, messages):#, timestamp, logiclevel):
+    def put_frame(self, frame, messages):  # , timestamp, logiclevel):
         # If the queue is full, arrayqueues should print a warning!
         try:
             if self.frame_queue.queue.qsize() < self.n_consumers + 2:
-                self.frame_queue.put(frame)#, timestamp)
+                self.frame_queue.put(frame)  # , timestamp)
             else:
                 messages.append("W:Dropped frame")
         except NotImplementedError:
             try:
-                self.frame_queue.put(frame)#, timestamp)
+                self.frame_queue.put(frame)  # , timestamp)
             except Full:
                 messages.append("W:Dropped frame")
         self.update_framerate()
@@ -95,7 +92,7 @@ class CameraSource(VideoSource):
     """Process for controlling a camera.
 
     Cameras currently implemented:
-    
+
     ======== ===========================================
     Ximea    Add some info
     Avt      Add some info
@@ -140,12 +137,7 @@ class CameraSource(VideoSource):
         self.state = None
         self.ring_buffer = None
         self.saved = True
-        self.screenWidth, self.screenHeight = pyautogui.size() # Get the size of the primary monitor.
-        base = 'F:/todelete'
-        self.load_path=os.path.join(base,'load.png')
-        self.start_path=os.path.join(base,'start.png')
-        self.end_path=os.path.join(base,'end.png')
-        
+
     def retrieve_params(self, messages):
         while True:
             try:
@@ -190,7 +182,7 @@ class CameraSource(VideoSource):
             # Grab the new frame, and put it in the queue if valid:
             try:
                 arr, timepoint, logic = self.cam.read()
-                timestamp = datetime.datetime.fromtimestamp(timepoint/1e9)
+                timestamp = datetime.datetime.fromtimestamp(timepoint / 1e9)
             except CameraError:
                 pass
 
@@ -209,22 +201,14 @@ class CameraSource(VideoSource):
             if self.ring_buffer is None or res_len != self.ring_buffer.length:
                 self.ring_buffer = RingBuffer(res_len)
 
-#######################################################################################################
+            #######################################################################################################
             if self.state.save_buffer:
                 if self.saved:
                     time.sleep(1)
                 else:
                     self.message_queue.put("   Saving buffer")
-                    
+
                     if self.ring_buffer.arr is not None:
-                        region= None
-                        try:
-                            region = pyautogui.locateOnScreen(self.end_path,confidence=0.85)
-                            pyautogui.click(region[0], region[1])    
-                        except:
-                            print('No end button found')
-                        region= None
-                        
                         self.frame_recorder = BufferVideoWriter(
                             input_queue=self.ring_buffer.get_all(),
                             meta_queue=self.ring_buffer.get_all_meta(),
@@ -232,8 +216,9 @@ class CameraSource(VideoSource):
                             # actual framerate (the "Framerate (Hz)" GUI control,
                             # default 200) instead of a hardcoded class default,
                             # so playback speed is correct.
-                            output_framerate=int(round(self.state.framerate)))
-    
+                            output_framerate=int(round(self.state.framerate)),
+                        )
+
                         p = Path()
                         self.current_timestamp = datetime.datetime.now()
                         time.sleep(1)
@@ -243,7 +228,7 @@ class CameraSource(VideoSource):
                         #     + str(self.metadata_animal.id)
                         # )
                         foldername = self.state.save_direc
-                        
+
                         fb = p.joinpath(
                             foldername, self.current_timestamp.strftime("%H%M%S") + "_"
                         )
@@ -254,11 +239,12 @@ class CameraSource(VideoSource):
                         self.saved = True
                         self.message_queue.put("   Saved")
                     else:
-                        self.message_queue.put("E:buffer saved before any frames acquired")
+                        self.message_queue.put(
+                            "E:buffer saved before any frames acquired"
+                        )
                     prt = None
-                    
-            
-#######################################################################################################                
+
+            #######################################################################################################
             elif self.state.paused:
                 self.message_queue.put(
                     "I:Ring_buffer_size:" + str(self.ring_buffer.length)
@@ -291,15 +277,6 @@ class CameraSource(VideoSource):
                         time.sleep(extrat)
                 prt = time.process_time()
             else:
-                region= None
-                if self.saved:
-                    try:
-                        region = pyautogui.locateOnScreen(self.start_path,confidence=0.85)
-                        pyautogui.click(region[0], region[1])    
-                    except:
-                        print('No start button found')
-                region= None
-
                 self.saved = False
                 prt = None
                 if arr is not None:
@@ -307,11 +284,12 @@ class CameraSource(VideoSource):
                         self.ring_buffer.put(arr, timepoint, logic)
                     except AttributeError:
                         pass
-                    self.put_frame(arr, messages)#, timestamp, logic) #
+                    self.put_frame(arr, messages)  # , timestamp, logic) #
             for m in messages:
                 self.message_queue.put(m)
 
         self.cam.release()
+
 
 class VideoFileSource(VideoSource):
     """A class to stream videos from a file to test parts of
@@ -400,8 +378,14 @@ class VideoFileSource(VideoSource):
             container.streams.video[0].thread_count = 1
 
             prt = None
-            while self.loop:
+            # Honor kill_event so the process exits on close. Otherwise this
+            # infinite decode loop ignores it and camera.join() in wrap_up hangs
+            # forever -- which is why only SIMULATION hangs on close (a real
+            # CameraSource already checks kill_event and exits cleanly).
+            while self.loop and not self.kill_event.is_set():
                 for framedata in container.decode(video=0):
+                    if self.kill_event.is_set():
+                        break
                     messages = []
                     if self.paused:
                         frame = self.old_frame
@@ -430,8 +414,8 @@ class VideoFileSource(VideoSource):
 
                 container.seek(0)  # loop back to start (PyAV >=9 dropped 'whence')
 
+            container.close()
             return
-
 
 
 class VideoControlParameters(ParametrizedQt):
@@ -477,4 +461,3 @@ class CameraControlParameters(ParametrizedQt):
         self.replay_limits = Param((0, 1200), gui=False)
         self.save_buffer = Param(False)
         self.save_direc = Param(tempfile.gettempdir(), gui="text")
-
