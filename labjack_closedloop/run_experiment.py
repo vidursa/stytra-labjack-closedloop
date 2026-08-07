@@ -228,7 +228,7 @@ AUTO_START_DELAY_S = 3.0
 #          ~/stytra_last_config.json on exit and applies it at startup). Use
 #          this once you have adjusted the tail points in the GUI and want to
 #          keep them run to run.
-PARAMS_SOURCE = "file"
+PARAMS_SOURCE = "last"
 
 
 def _build_stytra_config():
