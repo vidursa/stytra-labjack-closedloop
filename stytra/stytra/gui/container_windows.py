@@ -1,7 +1,7 @@
 import logging
 import datetime
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QLabel,
     QWidget,
@@ -26,6 +26,13 @@ from stytra.stimulation.stimulus_display import StimulusDisplayOnMainWindow
 
 from lightparam.gui import ParameterGui, pretty_name, ControlCombo, ControlButton
 
+# Refresh interval (ms) for the scrolling trace plot. It is driven by its OWN
+# timer, decoupled from the gui_timer (which runs at the fast trigger-poll rate,
+# e.g. 250 Hz). Rebuilding the plot DataFrames ~30x/s instead of ~250x/s keeps
+# the GUI thread free for draining fresh tail_sum to the trigger; 33 ms (~30 Hz)
+# is visually smooth for a scrolling trace.
+PLOT_REFRESH_INTERVAL_MS = 33
+
 
 class QPlainTextEditLogger(logging.Handler):
     def __init__(self):
@@ -44,7 +51,7 @@ class QPlainTextEditLogger(logging.Handler):
 
 
 class ExperimentWindow(QMainWindow):
-    """ Window for controlling a simple experiment including only a monitor
+    """Window for controlling a simple experiment including only a monitor
     the relative controls and the buttons for data_log and protocol control.
     All widgets objects are created and connected in the `__init__` and then added
     ti the GUI in the `construct_ui` method
@@ -111,8 +118,7 @@ class ExperimentWindow(QMainWindow):
         self.metadata_win = None
 
     def change_folder_gui(self):
-        """ Open dialog window to specify a new saving directory.
-        """
+        """Open dialog window to specify a new saving directory."""
         folder = QFileDialog.getExistingDirectory(
             caption="Results folder", directory=self.experiment.base_dir
         )
@@ -122,8 +128,7 @@ class ExperimentWindow(QMainWindow):
             self.act_folder.setText("Save in {}".format(self.experiment.base_dir))
 
     def show_metadata_gui(self):
-        """ Open Param GUI to control general experiment and animal metadata.
-        """
+        """Open Param GUI to control general experiment and animal metadata."""
         # Create widget, horizontal layout
         self.metadata_win = QWidget()
         self.metadata_win.setLayout(QHBoxLayout())
@@ -135,13 +140,11 @@ class ExperimentWindow(QMainWindow):
         self.metadata_win.show()
 
     def add_dock(self, item: QDockWidget):
-        """ Adding a new DockWidget updating the docks dictionary.
-        """
+        """Adding a new DockWidget updating the docks dictionary."""
         self.docks[item.objectName()] = item
 
     def construct_ui(self):
-        """ UI construction function.
-        """
+        """UI construction function."""
         self.addToolBar(Qt.TopToolBarArea, self.toolbar_control)
 
         log_dock = QDockWidget("Log", self)
@@ -165,13 +168,11 @@ class ExperimentWindow(QMainWindow):
         self.setCentralWidget(None)
 
     def write_log(self, msg):
-        """ Write something in the log window.
-        """
+        """Write something in the log window."""
         self.log_widget.textCursor().appendPlainText(msg)
 
     def toggle_db(self, tg):
-        """ Toggle database button.
-        """
+        """Toggle database button."""
         if self.chk_db.isChecked():
             self.experiment.use_db = True
         else:
@@ -195,7 +196,7 @@ class ExperimentWindow(QMainWindow):
 
 
 class VisualExperimentWindow(ExperimentWindow):
-    """ Window for controlling a visual experiment, where we add the projector
+    """Window for controlling a visual experiment, where we add the projector
     calibration widget.
 
     Parameters
@@ -235,8 +236,7 @@ class VisualExperimentWindow(ExperimentWindow):
 
 
 class CameraExperimentWindow(VisualExperimentWindow):
-    """ Window for an experiment with a camera
-    """
+    """Window for an experiment with a camera"""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -303,7 +303,13 @@ class DynamicStimExperimentWindow(VisualExperimentWindow):
         """ """
 
         super().construct_ui()
-        self.experiment.gui_timer.timeout.connect(self.stream_plot.update)
+        # Drive the scrolling plot on its own ~30 Hz timer, not the fast
+        # gui_timer (see PLOT_REFRESH_INTERVAL_MS). update() no-ops while frozen,
+        # so an always-on timer is fine.
+        self._plot_refresh_timer = QTimer()
+        self._plot_refresh_timer.setInterval(PLOT_REFRESH_INTERVAL_MS)
+        self._plot_refresh_timer.timeout.connect(self.stream_plot.update)
+        self._plot_refresh_timer.start()
         # TODO put in right place
         monitoring_widget = QWidget()
         monitoring_widget.setLayout(self.monitoring_layout)
@@ -374,7 +380,13 @@ class TrackingExperimentWindow(CameraExperimentWindow):
     def construct_ui(self):
         """ """
         previous_widget = super().construct_ui()
-        self.experiment.gui_timer.timeout.connect(self.stream_plot.update)
+        # Drive the scrolling plot on its own ~30 Hz timer, not the fast
+        # gui_timer (see PLOT_REFRESH_INTERVAL_MS). update() no-ops while frozen,
+        # so an always-on timer is fine.
+        self._plot_refresh_timer = QTimer()
+        self._plot_refresh_timer.setInterval(PLOT_REFRESH_INTERVAL_MS)
+        self._plot_refresh_timer.timeout.connect(self.stream_plot.update)
+        self._plot_refresh_timer.start()
 
         monitoring_widget = QWidget()
         monitoring_widget.setLayout(self.monitoring_layout)

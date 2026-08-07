@@ -416,6 +416,11 @@ class TrackingExperiment(CameraVisualExperiment):
     def initialize_plots(self) -> None:
         super().initialize_plots()
         self.refresh_plots()
+        # Red vertical marker on the trace plot at the moment recording starts.
+        sp = self.window_main.stream_plot
+        self.protocol_runner.sig_protocol_started.connect(sp.mark_recording_start)
+        self.protocol_runner.sig_protocol_finished.connect(sp.clear_recording_start)
+        self.protocol_runner.sig_protocol_interrupted.connect(sp.clear_recording_start)
 
     def refresh_plots(self) -> None:
         self.window_main.stream_plot.remove_streams()
@@ -438,9 +443,12 @@ class TrackingExperiment(CameraVisualExperiment):
 
     def start_protocol(self) -> None:
         # Freeze the plots so the plotting does not interfere with
-        # stimulus display
-        if not self.window_main.stream_plot.frozen:
-            self.window_main.stream_plot.toggle_freeze()
+        # stimulus display. Skipped when keep_plot_live_during_protocol is set
+        # (e.g. closed-loop runs that want the tail trace to keep scrolling
+        # through the protocol); the plot then keeps updating during recording.
+        if not getattr(self, "keep_plot_live_during_protocol", False):
+            if not self.window_main.stream_plot.frozen:
+                self.window_main.stream_plot.toggle_freeze()
 
         # Reset data accumulator when starting the protocol.
         self.gui_timer.stop()
