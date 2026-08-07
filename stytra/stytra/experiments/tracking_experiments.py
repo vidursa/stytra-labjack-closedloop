@@ -1,4 +1,5 @@
 import traceback
+import datetime
 
 import numpy as np
 from multiprocessing import Queue, Event
@@ -355,6 +356,18 @@ class TrackingExperiment(CameraVisualExperiment):
         # Data accumulator is updated with GUI timer:
         self.gui_timer.timeout.connect(self.acc_tracking.update_list)
 
+        # --- v2 buffer-save mode state ---------------------------------------
+        # Enabled by run_experiment for "always-on rolling buffer" runs. When on:
+        #  * save_data() writes nothing at protocol end (only explicit saves);
+        #  * the in-RAM logs are trimmed to the buffer window each tick, so an
+        #    open-ended run does not grow memory without bound.
+        self.suppress_session_save = False
+        self.buffer_trim_enabled = False
+        # Wall-clock boundary of the not-yet-saved region: start of recording, or
+        # the last explicit save. A save grabs min(now - this, buffer_length).
+        self._buffer_last_save_t = None
+        self.gui_timer.timeout.connect(self._buffer_trim_logs)
+
         # Tracking is reset at experiment start:
         self.protocol_runner.sig_protocol_started.connect(self.acc_tracking.reset)
 
@@ -434,6 +447,129 @@ class TrackingExperiment(CameraVisualExperiment):
         if self.stim_plot:  # but also if forced:
             self.window_main.stream_plot.add_stream(self.protocol_runner.dynamic_log)
 
+    def request_clip_save(self):
+        """v2: save a COMPLETE SET for the not-yet-saved window -- as though a
+        protocol had run for the last N seconds. Writes, under one shared
+        ``HHMMSS_`` basename in the session folder:
+
+          * ``…video.mp4`` / ``…video_times.csv`` / ``…clocksync.csv`` (camera
+            process, from the rolling buffer)
+          * ``…behavior_log.csv`` / ``…stimulus_log.csv`` /
+            ``…estimator_log.csv`` (this process, from the in-RAM accumulators)
+          * ``…metadata.json`` (best-effort snapshot of the parameter tree)
+
+        The window is ``min(now - last_save, ring_buffer_length)`` so consecutive
+        saves are back-to-back and non-overlapping; if more than a buffer-length
+        has elapsed it is capped at what the buffer still holds. The trace marker
+        is advanced to now. Called from the camera-view "save clip" button and
+        the stimulus auto-save. Returns the basename, or None if this source has
+        no rolling buffer.
+        """
+        cs = getattr(self, "camera_state", None)
+        if cs is None or not hasattr(cs, "save_request_count"):
+            return None  # video-file source: no rolling buffer to save
+
+        now = datetime.datetime.now()
+
+        # ring_buffer_length (seconds) caps the window; the not-yet-saved region
+        # runs from the last save (or recording start) up to now.
+        try:
+            buflen = float(cs.ring_buffer_length)
+        except (AttributeError, TypeError, ValueError):
+            buflen = 60.0
+        ref = self._buffer_last_save_t or getattr(self, "t0", None) or now
+        window_s = (now - ref).total_seconds()
+        if window_s <= 0 or window_s > buflen:
+            window_s = buflen
+
+        stamp = now.strftime("%H%M%S")
+        basename = str(Path(self.folder_name).joinpath(stamp + "_"))
+
+        # Log snapshots (same names as a full session save).
+        #
+        # NOTE (possible future optimization): these writes run SYNCHRONOUSLY on
+        # the GUI thread, so a save briefly (~0.1-0.25 s for a 60 s buffer) pauses
+        # the closed-loop DECISION loop -- NOT tracking or frame capture (those
+        # are separate processes and keep buffering) and NOT time-sync (every log
+        # timestamps itself from real time against exp.t0, so timestamps stay
+        # correct across the pause; only the trigger stops evaluating during it).
+        # It's usually harmless because auto-save fires ~10 s after a bout. If
+        # that trigger pause ever matters, move the write off the GUI thread with
+        # ONE worker thread + hand-off: here, snapshot the last-N rows cheaply
+        # (e.g. times[-n:] / stored_data[-n:] list slices) and enqueue them to a
+        # background writer thread that builds the DataFrame + to_csv + dc.save --
+        # same pattern as the camera's _writer_loop. Keep the SLICE on this thread
+        # (reading the accumulators off-thread races with their gui_timer append).
+        self._save_log_clip(self.acc_tracking, window_s, basename + "behavior_log.csv")
+        self._save_log_clip(
+            self.protocol_runner.dynamic_log, window_s, basename + "stimulus_log.csv"
+        )
+        if self.estimator is not None:
+            self._save_log_clip(
+                self.estimator_log, window_s, basename + "estimator_log.csv"
+            )
+        try:  # parameter-tree snapshot; best-effort, do not fail the save on it
+            self.dc.save(basename + "metadata.json")
+        except Exception:
+            pass
+
+        # Point the camera process at the same folder + basename and the same
+        # window, then bump the counter (all sync together on the next tick, so
+        # they are in place before the camera acts on the increment).
+        cs.save_direc = self.folder_name
+        cs.save_clip_basename = basename
+        cs.save_clip_seconds = float(window_s)
+        cs.save_request_count = cs.save_request_count + 1
+
+        # Advance the save boundary and move the trace marker to now.
+        self._buffer_last_save_t = now
+        try:
+            self.window_main.stream_plot.mark_buffer_save(now)
+        except (AttributeError, KeyError):
+            pass
+        return basename
+
+    @staticmethod
+    def _save_log_clip(accumulator, window_s, path):
+        """Write the last `window_s` seconds of an accumulator to `path` (CSV),
+        time column first. No-op if the accumulator has no usable data yet."""
+        try:
+            df = accumulator.get_last_t(window_s)
+            if df is None:
+                df = accumulator.get_last_n()  # fall back to whatever is buffered
+        except Exception:
+            df = None
+        if df is None or len(df) == 0:
+            return
+        cols = ["t"] + [c for c in df.columns if c != "t"]
+        df.to_csv(path, columns=cols, index=False)
+
+    def _buffer_trim_logs(self):
+        """Buffer mode only: keep the in-RAM behaviour / stimulus / estimator
+        logs bounded to ~the rolling-buffer window, so an open-ended run does not
+        grow memory forever. A save only ever reads back one buffer-length, so
+        keeping 1.5x that is always enough. No-op unless buffer_trim_enabled."""
+        if not self.buffer_trim_enabled:
+            return
+        cs = getattr(self, "camera_state", None)
+        try:
+            keep = int(1.5 * float(cs.ring_buffer_length) * float(cs.framerate))
+        except (AttributeError, TypeError, ValueError):
+            return
+        if keep <= 0:
+            return
+        accs = [self.acc_tracking, self.protocol_runner.dynamic_log]
+        if self.estimator is not None:
+            accs.append(self.estimator_log)
+        for acc in accs:
+            if acc is None:
+                continue
+            n = len(acc.times)
+            if n > keep * 1.5:
+                drop = n - keep
+                del acc.times[:drop]
+                del acc.stored_data[:drop]
+
     def send_gui_parameters(self) -> None:
         """
         Called upon gui timeout, put tracking parameters in the relative queue.
@@ -455,6 +591,10 @@ class TrackingExperiment(CameraVisualExperiment):
 
         super().start_protocol()
 
+        # The not-yet-saved region starts now (recording start). The plot marker
+        # is set by mark_recording_start via sig_protocol_started.
+        self._buffer_last_save_t = datetime.datetime.now()
+
         self.gui_timer.start(1000 // 60)
 
     def end_protocol(self, save: bool = True) -> None:
@@ -464,6 +604,11 @@ class TrackingExperiment(CameraVisualExperiment):
 
     def save_data(self) -> None:
         """Save tail position and dynamic parameters and terminate."""
+
+        # Buffer-save mode: write nothing at protocol end -- only the sets the
+        # user explicitly saved via request_clip_save() are kept.
+        if getattr(self, "suppress_session_save", False):
+            return
 
         self.window_main.camera_display.save_image(
             name=self.filename_base() + "img.png"

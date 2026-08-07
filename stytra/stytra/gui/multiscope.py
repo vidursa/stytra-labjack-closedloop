@@ -130,6 +130,17 @@ class MultiStreamPlot(QWidget):
         self.recording_line.setVisible(False)
         self.plotContainer.addItem(self.recording_line, ignoreBounds=True)
 
+        # v2 (buffer mode): orange marker at the last save (or recording start
+        # before the first save). It scrolls left with the timeline, so its
+        # distance from the right edge = how much not-yet-saved data is stored;
+        # once it leaves the window the buffer is full again.
+        self._last_save_time = None
+        self.save_line = pg.InfiniteLine(
+            pos=0, angle=90, pen=pg.mkPen((240, 150, 30), width=2)
+        )
+        self.save_line.setVisible(False)
+        self.plotContainer.addItem(self.save_line, ignoreBounds=True)
+
         self.active_plots = []
 
         self.accumulators = accumulators or []
@@ -320,6 +331,10 @@ class MultiStreamPlot(QWidget):
             self.recording_line.setValue(
                 (self._recording_start_time - current_time).total_seconds()
             )
+        if self._last_save_time is not None:
+            self.save_line.setValue(
+                (self._last_save_time - current_time).total_seconds()
+            )
 
         i_stream = 0
         for i_acc, (acc, sel_cols) in enumerate(
@@ -451,14 +466,25 @@ class MultiStreamPlot(QWidget):
         self.wnd_config.show()
 
     def mark_recording_start(self):
-        """Show the red vertical marker at the current moment (protocol start)."""
-        self._recording_start_time = datetime.datetime.now()
+        """Show the red recording-start marker, and start the save boundary at
+        the same moment (nothing saved yet)."""
+        now = datetime.datetime.now()
+        self._recording_start_time = now
         self.recording_line.setVisible(True)
+        self._last_save_time = now
+        self.save_line.setVisible(True)
+
+    def mark_buffer_save(self, when=None):
+        """Move the orange 'last save' marker to `when` (default: now)."""
+        self._last_save_time = when or datetime.datetime.now()
+        self.save_line.setVisible(True)
 
     def clear_recording_start(self):
-        """Hide the recording-start marker (protocol finished / interrupted)."""
+        """Hide both markers (protocol finished / interrupted)."""
         self._recording_start_time = None
         self.recording_line.setVisible(False)
+        self._last_save_time = None
+        self.save_line.setVisible(False)
 
 
 class StreamPlotConfig(QWidget):

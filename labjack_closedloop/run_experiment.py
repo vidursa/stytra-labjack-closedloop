@@ -138,6 +138,53 @@ OPPOSITE_THRESHOLD = 0.45
 # the "how far after the other-side bend to stimulate" knob.
 FIRE_LEVEL = -0.4  # only for predictive
 
+# --- v2: auto-save rolling video clips on behaviour (real camera only) ----
+# When True, each behaviour onset asks the camera to save the last CLIP_LENGTH_S
+# seconds of video to the session folder. The encode runs on a background writer
+# thread inside the camera process, so the closed loop keeps acquiring and
+# triggering with no dropped frames (this is the whole point of "version 2").
+# Rate-limited to one clip per CLIP_MIN_INTERVAL_S because clips are long.
+#
+# Needs USE_REAL_CAMERA: the rolling buffer only exists for a real camera, so
+# with the recorded-video source this is a harmless no-op (a note is printed).
+# The manual "save clip" button on the camera view does the same thing on click.
+#
+# Each saved clip writes, next to <HHMMSS_>video.mp4:
+#   * <HHMMSS_>video_times.csv  -- per-frame camera hardware timestamps
+#   * <HHMMSS_>clocksync.csv    -- newest-frame timestamp vs host wall/monotonic
+# which together let you align the clip to the behaviour + LabJack-pulse logs.
+AUTOSAVE_CLIP_ON_STIM = False
+CLIP_LENGTH_S = 60.0  # rolling buffer length saved per clip (seconds)
+CLIP_MIN_INTERVAL_S = 30.0  # min gap between clip saves (clips are long)
+# Auto-save waits until the behaviour has ENDED and stayed off this many seconds
+# before saving, so the saved window captures the bout plus its aftermath. A new
+# behaviour during the wait cancels it and re-arms when that bout ends.
+CLIP_POST_BEHAVIOUR_S = 10.0
+
+# --- v2: record mode -----------------------------------------------------
+# "session" : classic stytra recording. Press ▶ to record for SESSION_DURATION_S;
+#             the video + all logs are written to disk at the end. The
+#             save-buffer button is hidden (recording and buffer-save are kept
+#             as separate modes so two video writers never run at once).
+# "buffer"  : always-on rolling buffer. There is NO full-session video and
+#             NOTHING is written when you stop; instead the closed loop runs
+#             open-ended and the "save clip" button (or auto-on-behaviour)
+#             writes a COMPLETE SET -- video + behaviour/stimulus/estimator
+#             logs + metadata -- for the last N seconds, as though a protocol
+#             had run for that window. Consecutive saves are back-to-back and
+#             non-overlapping: each grabs min(time since last save, N seconds).
+#             A red marker on the trace shows recording start; an orange marker
+#             shows the last save and scrolls out over N s so you can see how
+#             much not-yet-saved data is still buffered.
+# Both need USE_REAL_CAMERA for video (the rolling buffer only exists for a real
+# camera); "buffer" is a no-op video-wise in simulation. Default "session" so a
+# forgotten save never loses a run.
+RECORD_MODE = "buffer"
+
+# In buffer mode the closed loop runs until you stop it (▶) or close the window,
+# not for a fixed SESSION_DURATION_S.
+OPEN_ENDED_DURATION_S = 10 * 365 * 24 * 3600.0  # ~10 years = effectively forever
+
 # --- latency config ------------------------------------------------------
 # stytra drains freshly-tracked frames into the accumulator (which the trigger
 # reads) on its `gui_timer`, which it starts at 60 Hz (~16 ms). That polling
@@ -181,23 +228,33 @@ AUTO_START_DELAY_S = 3.0
 #          ~/stytra_last_config.json on exit and applies it at startup). Use
 #          this once you have adjusted the tail points in the GUI and want to
 #          keep them run to run.
-PARAMS_SOURCE = "last"
+PARAMS_SOURCE = "file"
 
 
-class RightBendClosedLoop(Protocol):
-    name = "labjack_right_bend_cl"
-
-    stytra_config = dict(
+def _build_stytra_config():
+    cfg = dict(
         display=dict(full_screen=False),
         tracking=dict(embedded=True, method="tail", estimator=RightBendEstimator),
         # Live camera when USE_REAL_CAMERA, otherwise the recorded video.
         camera=(
             dict(REAL_CAMERA) if USE_REAL_CAMERA else dict(video_file=str(VIDEO_FILE))
         ),
+    )
+    if RECORD_MODE == "session":
+        # Always-on session recording. Omitted in buffer mode so there is no
+        # full-session video writer -- video comes only from explicit saves.
         # output_framerate must match the acquisition rate or the saved .mp4
         # plays back at the wrong speed (see CAMERA_FPS).
-        recording=dict(extension="mp4", kbit_rate=10000, output_framerate=CAMERA_FPS),
-    )
+        cfg["recording"] = dict(
+            extension="mp4", kbit_rate=10000, output_framerate=CAMERA_FPS
+        )
+    return cfg
+
+
+class RightBendClosedLoop(Protocol):
+    name = "labjack_right_bend_cl"
+
+    stytra_config = _build_stytra_config()
 
     def __init__(self):
         super().__init__()
@@ -228,10 +285,19 @@ class RightBendClosedLoop(Protocol):
                 opposite_threshold=OPPOSITE_THRESHOLD,
                 fire_level=FIRE_LEVEL,
                 circle_display_s=CIRCLE_DISPLAY_S,
+                # Auto-save only in buffer mode; in session mode it would spawn a
+                # second video writer during the full-session recording.
+                autosave_clip=(AUTOSAVE_CLIP_ON_STIM and RECORD_MODE == "buffer"),
+                clip_min_interval_s=CLIP_MIN_INTERVAL_S,
+                clip_post_behaviour_s=CLIP_POST_BEHAVIOUR_S,
                 # Use the module constant, NOT self.session_duration, so the
                 # length can't be silently reset to an old value by stytra's
-                # config restore.
-                duration=SESSION_DURATION_S,
+                # config restore. Buffer mode runs open-ended (stop with ▶).
+                duration=(
+                    OPEN_ENDED_DURATION_S
+                    if RECORD_MODE == "buffer"
+                    else SESSION_DURATION_S
+                ),
             )
         ]
 
@@ -331,6 +397,45 @@ def main(argv=None):
     # red vertical marker at the moment recording started. If you ever see the
     # stimulus display stutter on a slow PC, set this back to False.
     st.exp.keep_plot_live_during_protocol = True
+
+    # v2 record-mode wiring.
+    if RECORD_MODE == "buffer":
+        # Always-on rolling buffer: write nothing on stop, and keep the in-RAM
+        # logs bounded so an open-ended run does not grow memory forever.
+        st.exp.suppress_session_save = True
+        st.exp.buffer_trim_enabled = True
+        print(
+            "v2: RECORD_MODE=buffer -- open-ended run, NOTHING is written on "
+            "stop.\n     Use the 'save clip' button (or AUTOSAVE_CLIP_ON_STIM) "
+            "to write a complete\n     set for the last {:g}s.".format(CLIP_LENGTH_S)
+        )
+    else:
+        # Classic session recording: hide the save-buffer button so the two
+        # video writers never run at once (recording vs buffer save).
+        disp = getattr(st.exp.window_main, "camera_display", None)
+        btn = getattr(disp, "btn_save_buffer", None)
+        if btn is not None:
+            btn.setVisible(False)
+        print(
+            "v2: RECORD_MODE=session -- classic full-session recording; "
+            "save-buffer button hidden."
+        )
+
+    # v2: size the camera rolling buffer to CLIP_LENGTH_S so a clip save (manual
+    # button or auto-on-behaviour) captures that many seconds. Real camera only:
+    # the video-file source (VideoControlParameters) has no rolling buffer, so
+    # the hasattr guard makes this a no-op in simulation. NOTE: stytra caps the
+    # buffer at max_buffer_length frames (12000 = 60 s @ 200 fps); a longer or
+    # faster clip is truncated to the cap (with a warning in the camera log).
+    if USE_REAL_CAMERA and hasattr(
+        getattr(st.exp, "camera_state", None), "ring_buffer_length"
+    ):
+        st.exp.camera_state.ring_buffer_length = CLIP_LENGTH_S
+        print(
+            "v2: rolling clip buffer = {:g}s; auto-save on behaviour {}.".format(
+                CLIP_LENGTH_S, "ON" if AUTOSAVE_CLIP_ON_STIM else "off (manual button)"
+            )
+        )
 
     # Apply the saved tail-tracking parameters. Pushing them straight onto the
     # tracking process' parameter queue guarantees the worker adopts them; we

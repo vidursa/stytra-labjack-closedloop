@@ -141,12 +141,21 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         circle_radius=0.15,
         circle_color=(255, 255, 255),
         background_color=(0, 0, 0),
+        autosave_clip=False,
+        clip_min_interval_s=30.0,
+        clip_post_behaviour_s=10.0,
         verbose=True,
         **kwargs
     ):
         super().__init__(
             *args,
-            dynamic_parameters=["tail_sum", "baseline", "triggered", "output_v", "pulse"],
+            dynamic_parameters=[
+                "tail_sum",
+                "baseline",
+                "triggered",
+                "output_v",
+                "pulse",
+            ],
             **kwargs
         )
         # Private (leading underscore) so they are excluded from get_state()
@@ -194,6 +203,18 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         self.circle_color = circle_color
         self.background_color = background_color
 
+        # v2: auto-save the last-N-seconds camera clip on a behaviour onset,
+        # rate-limited to one clip per clip_min_interval_s (clips are long, so
+        # overlapping saves make no sense). Real camera only (rolling buffer).
+        self.autosave_clip = bool(autosave_clip)
+        self.clip_min_interval_s = float(clip_min_interval_s)
+        # Quiet time (s) the behaviour must stay OFF after ending before we save,
+        # so the saved window captures the bout plus its aftermath.
+        self.clip_post_behaviour_s = float(clip_post_behaviour_s)
+        self._last_clip_t = None
+        self._pending_save_t = None  # _elapsed when the last bout ended (armed)
+        self._clip_warned = False
+
         self.verbose = verbose
         self._prev_active = False
 
@@ -206,9 +227,9 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         # Dynamic (per-frame logged) state:
         self.tail_sum = 0.0
         self.baseline = 0.0  # current resting-offset estimate (0 when mode="off")
-        self.triggered = 0   # circle / output-active state
+        self.triggered = 0  # circle / output-active state
         self.output_v = 0.0
-        self.pulse = 0       # 1 only on the exact frame a pulse fires
+        self.pulse = 0  # 1 only on the exact frame a pulse fires
 
         self.name = "right_bend_trigger"
 
@@ -248,6 +269,8 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         self._delay.reset()
         self._baseline.reset()
         self._last_emit_t = None
+        self._last_clip_t = None
+        self._pending_save_t = None
         self._prev_active = False
         self._peak_signed = float("-inf")
         self._n_over = 0
@@ -277,15 +300,31 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
                     )
                 )
             if self.stim_delay_s > 0 and self.pulse_mode != "level":
-                print("[trigger] stimulation delayed {:.0f} ms after detection".format(
-                    self.stim_delay_s * 1000))
+                print(
+                    "[trigger] stimulation delayed {:.0f} ms after detection".format(
+                        self.stim_delay_s * 1000
+                    )
+                )
             if self.baseline_mode == "fixed":
-                print("[trigger] baseline: fixed re-zero of {:+.3f} rad".format(
-                    self.baseline_offset))
+                print(
+                    "[trigger] baseline: fixed re-zero of {:+.3f} rad".format(
+                        self.baseline_offset
+                    )
+                )
             elif self.baseline_mode in ("start", "running"):
-                print("[trigger] baseline: {} re-zero over a {:.1f}s window "
-                      "(threshold applied to tail_sum - baseline)".format(
-                          self.baseline_mode, self.baseline_window_s))
+                print(
+                    "[trigger] baseline: {} re-zero over a {:.1f}s window "
+                    "(threshold applied to tail_sum - baseline)".format(
+                        self.baseline_mode, self.baseline_window_s
+                    )
+                )
+            if self.autosave_clip:
+                print(
+                    "[clip] autosave ON: saving the rolling camera clip on "
+                    "each behaviour onset, at most 1 per {:g}s".format(
+                        self.clip_min_interval_s
+                    )
+                )
 
     def update(self):
         super().update()
@@ -329,7 +368,9 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
                 # Anticipatory: fire as the tail swings back from the opposite
                 # side up through fire_level (default neutral). Pass the oriented
                 # RE-ZEROED value (nan when tracking is lost, so the state holds).
-                detected = self._predictor.step(self._elapsed, self._detector.signed(corrected))
+                detected = self._predictor.step(
+                    self._elapsed, self._detector.signed(corrected)
+                )
             else:
                 # "fixed": one detection per rising edge of the bend, rate-limited.
                 detected = self._pulser.step(self._elapsed, over)
@@ -359,9 +400,60 @@ class RightBendTriggerStimulus(VisualStimulus, DynamicStimulus):
         # Live terminal feedback on every on/off transition (independent of the
         # GUI plot, which stytra freezes while a protocol is running).
         if self.verbose and active != self._prev_active:
-            print("[trigger] t={:7.3f}s  tail_sum={:+.3f}  ->  {}".format(
-                self._elapsed, self.tail_sum, "ON " if active else "off"))
+            print(
+                "[trigger] t={:7.3f}s  tail_sum={:+.3f}  ->  {}".format(
+                    self._elapsed, self.tail_sum, "ON " if active else "off"
+                )
+            )
+        # v2 auto-save: wait until the behaviour has ENDED and stayed off for
+        # clip_post_behaviour_s, THEN save, so the window captures the bout plus
+        # its aftermath. A new behaviour during the wait cancels the pending save
+        # and re-arms when THAT bout ends -- so the delay is "quiet time since the
+        # last behaviour" and one save spans a whole bout sequence.
+        if self.autosave_clip:
+            if active and not self._prev_active:
+                self._pending_save_t = None  # new bout started: cancel pending
+            elif self._prev_active and not active:
+                self._pending_save_t = self._elapsed  # bout ended: arm the timer
+            if (
+                self._pending_save_t is not None
+                and (self._elapsed - self._pending_save_t) >= self.clip_post_behaviour_s
+            ):
+                self._maybe_save_clip()
+                self._pending_save_t = None
         self._prev_active = active
+
+    def _maybe_save_clip(self):
+        """Request one non-blocking save of the camera's last-N-s rolling buffer,
+        at most once per clip_min_interval_s. No-op unless a real camera exposes
+        the rolling buffer (``save_request_count`` on its camera_state)."""
+        cam_state = getattr(self._experiment, "camera_state", None)
+        if cam_state is None or not hasattr(cam_state, "save_request_count"):
+            if not self._clip_warned:
+                print(
+                    "[clip] autosave_clip is ON but this source has no rolling "
+                    "buffer (needs USE_REAL_CAMERA); skipping clip saves."
+                )
+                self._clip_warned = True
+            return
+        if (
+            self._last_clip_t is not None
+            and (self._elapsed - self._last_clip_t) < self.clip_min_interval_s
+        ):
+            return
+        self._last_clip_t = self._elapsed
+        req = getattr(self._experiment, "request_clip_save", None)
+        if req is not None:
+            # Also snapshots the behaviour/stimulus logs under a shared basename.
+            req()
+        else:
+            try:
+                cam_state.save_direc = self._experiment.folder_name
+            except Exception:
+                pass
+            cam_state.save_request_count = cam_state.save_request_count + 1
+        if self.verbose:
+            print("[clip] save requested at t={:.3f}s".format(self._elapsed))
 
     def stop(self):
         super().stop()

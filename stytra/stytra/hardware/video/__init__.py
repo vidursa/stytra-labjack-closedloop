@@ -6,6 +6,8 @@ implement video saving
 import numpy as np
 from multiprocessing import Queue, Event
 from queue import Empty, Full
+from queue import Queue as ThreadQueue
+import threading
 from pathlib import Path
 from lightparam import Param
 from lightparam.param_qt import ParametrizedQt
@@ -136,7 +138,27 @@ class CameraSource(VideoSource):
 
         self.state = None
         self.ring_buffer = None
-        self.saved = True
+
+        # --- v2 non-blocking clip saving -------------------------------------
+        # In v1 the "save buffer" encoded the whole ring buffer *inline* in this
+        # acquisition loop (blocking cam.read() for seconds -> dropped frames and
+        # a blind closed loop) and triggered itself via pyautogui screen scraping
+        # of hardcoded F:/todelete/*.png buttons. v2 removes all of that:
+        #  * saves are triggered by an edge on the `save_request_count` param,
+        #    which the GUI button OR the stimulus can bump directly;
+        #  * the actual encode runs on a background writer thread, so the
+        #    acquisition loop keeps grabbing frames throughout;
+        #  * on trigger we swap in a spare ring buffer (O(1)) and hand the full
+        #    one to the writer, so acquisition never waits on a memcpy either.
+        # These are created lazily inside run() (Windows uses spawn, so threads /
+        # thread-queues must be built in the child process, not here).
+        self._save_queue = None  # ThreadQueue of pending encode jobs
+        self._spare_queue = None  # ThreadQueue of idle RingBuffers to reuse
+        self._writer_thread = None
+        self._served_saves = 0  # last save_request_count we acted on
+        self._max_pending_saves = 2  # bound memory: queued clips awaiting encode
+        self._max_spare_buffers = 2  # idle buffers kept for reuse
+        self._clip_kbit_rate = 10000  # encode quality for saved clips
 
     def retrieve_params(self, messages):
         while True:
@@ -173,6 +195,7 @@ class CameraSource(VideoSource):
             raise Exception("{} is not a valid camera type!".format(self.camera_type))
         camera_messages = list(self.cam.open_camera())
         [self.message_queue.put(m) for m in camera_messages]
+        self._start_writer_thread()
         prt = None
         while not self.kill_event.is_set():
             # Try to get new parameters from the control queue:
@@ -201,51 +224,17 @@ class CameraSource(VideoSource):
             if self.ring_buffer is None or res_len != self.ring_buffer.length:
                 self.ring_buffer = RingBuffer(res_len)
 
-            #######################################################################################################
-            if self.state.save_buffer:
-                if self.saved:
-                    time.sleep(1)
-                else:
-                    self.message_queue.put("   Saving buffer")
+            # --- v2: edge-triggered, non-blocking clip save ------------------
+            # A rising `save_request_count` (bumped by the GUI "save clip" button
+            # or by the stimulus on a detected behaviour) schedules exactly one
+            # clip. All the heavy work (memcpy + encode) happens off this loop:
+            # here we only do an O(1) ring-buffer swap and enqueue a job, so
+            # cam.read() keeps running and no frames are dropped.
+            if self.state.save_request_count > self._served_saves:
+                self._served_saves = self.state.save_request_count
+                self._schedule_clip_save(res_len)
 
-                    if self.ring_buffer.arr is not None:
-                        self.frame_recorder = BufferVideoWriter(
-                            input_queue=self.ring_buffer.get_all(),
-                            meta_queue=self.ring_buffer.get_all_meta(),
-                            # Stamp the saved buffer video with the camera's
-                            # actual framerate (the "Framerate (Hz)" GUI control,
-                            # default 200) instead of a hardcoded class default,
-                            # so playback speed is correct.
-                            output_framerate=int(round(self.state.framerate)),
-                        )
-
-                        p = Path()
-                        self.current_timestamp = datetime.datetime.now()
-                        time.sleep(1)
-                        # self.animal_id = (
-                        #     self.current_timestamp.strftime("%y%m%d")
-                        #     + "_f"
-                        #     + str(self.metadata_animal.id)
-                        # )
-                        foldername = self.state.save_direc
-
-                        fb = p.joinpath(
-                            foldername, self.current_timestamp.strftime("%H%M%S") + "_"
-                        )
-                        self.frame_recorder.filename_queue.put(fb)
-                        self.frame_recorder.run()
-                        self.ring_buffer.reset()
-                        # self.state.save_buffer = False
-                        self.saved = True
-                        self.message_queue.put("   Saved")
-                    else:
-                        self.message_queue.put(
-                            "E:buffer saved before any frames acquired"
-                        )
-                    prt = None
-
-            #######################################################################################################
-            elif self.state.paused:
+            if self.state.paused:
                 self.message_queue.put(
                     "I:Ring_buffer_size:" + str(self.ring_buffer.length)
                 )
@@ -277,7 +266,6 @@ class CameraSource(VideoSource):
                         time.sleep(extrat)
                 prt = time.process_time()
             else:
-                self.saved = False
                 prt = None
                 if arr is not None:
                     try:
@@ -288,7 +276,145 @@ class CameraSource(VideoSource):
             for m in messages:
                 self.message_queue.put(m)
 
+        # Loop exited: flush/stop the background writer, then release the camera.
+        self._stop_writer_thread()
         self.cam.release()
+
+    # ----------------------------------------------------------- v2 helpers --
+    def _start_writer_thread(self):
+        """Spawn the background clip-encoder thread once, inside this process
+        (spawn-safe: queues/threads must be created in the child, not __init__)."""
+        if self._writer_thread is not None:
+            return
+        self._save_queue = ThreadQueue(maxsize=self._max_pending_saves)
+        self._spare_queue = ThreadQueue(maxsize=self._max_spare_buffers)
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop, name="clip_writer", daemon=True
+        )
+        self._writer_thread.start()
+
+    def _stop_writer_thread(self):
+        """Ask the writer to finish queued clips and exit (called at loop end)."""
+        if self._writer_thread is None:
+            return
+        try:
+            self._save_queue.put(None, timeout=1.0)
+        except Full:
+            pass
+        self._writer_thread.join(timeout=30.0)
+        self._writer_thread = None
+
+    def _get_spare_buffer(self, length):
+        """An empty RingBuffer of `length` to keep acquiring into while the full
+        one is encoded. Reuse a pooled buffer of the right size, else allocate a
+        fresh one (its array is allocated lazily on the first put)."""
+        while True:
+            try:
+                b = self._spare_queue.get_nowait()
+            except Empty:
+                return RingBuffer(length)
+            if b.length == length:
+                b.reset()
+                return b
+            # wrong size (framerate/length changed since it was pooled): drop it
+
+    def _schedule_clip_save(self, length):
+        """O(1) hand-off: swap in a spare buffer and queue the full one for the
+        writer thread. Never blocks the acquisition loop on encode or memcpy."""
+        full = self.ring_buffer
+        if full is None or full.arr is None:
+            self.message_queue.put("E:clip save requested before any frames acquired")
+            return
+        spare = self._get_spare_buffer(length)
+        # Anchor to bridge the camera hardware clock (per-frame timepoints) to
+        # the host wall/monotonic clocks used by the behaviour + pulse logs.
+        anchor = dict(host_time=time.time(), monotonic=time.monotonic())
+        # Prefer the basename the main process picked (so the video pairs up with
+        # its behaviour/stimulus log snapshots); fall back to an HHMMSS_ stamp.
+        basename = getattr(self.state, "save_clip_basename", "") or ""
+        if basename:
+            fname = basename
+        else:
+            stamp = datetime.datetime.now().strftime("%H%M%S")
+            fname = str(Path(self.state.save_direc).joinpath(stamp + "_"))
+        # Save only the last `save_clip_seconds` worth of frames (0 -> whole
+        # buffer); the writer thread slices the newest n_frames.
+        fps = int(round(self.state.framerate))
+        clip_s = getattr(self.state, "save_clip_seconds", 0.0) or 0.0
+        n_frames = int(round(clip_s * self.state.framerate)) if clip_s > 0 else 0
+        job = (full, fname, fps, anchor, n_frames)
+        try:
+            self._save_queue.put_nowait(job)
+        except Full:
+            # Writer still busy: keep the history (revert the swap) and warn,
+            # rather than dropping frames silently.
+            self.message_queue.put(
+                "W:Clip save skipped -- writer busy ({} clips already queued)".format(
+                    self._max_pending_saves
+                )
+            )
+            try:
+                self._spare_queue.put_nowait(spare)
+            except Full:
+                pass
+            return
+        self.ring_buffer = spare
+        self.message_queue.put("I:Clip save queued ({} frames)".format(full.length))
+
+    def _writer_loop(self):
+        """Background thread: encode queued ring-buffer snapshots to disk. PyAV
+        releases the GIL while encoding, so the acquisition loop runs unimpeded."""
+        while True:
+            try:
+                job = self._save_queue.get(timeout=0.25)
+            except Empty:
+                if self.kill_event.is_set():
+                    break
+                continue
+            if job is None:
+                break
+            full, fname, fps, anchor, n_frames = job
+            try:
+                frames = full.get_all()
+                times, logic = full.get_all_meta()
+                # Keep only the newest n_frames (windowed save); 0 = whole buffer.
+                if n_frames and 0 < n_frames < len(frames):
+                    frames = frames[-n_frames:]
+                    times = times[-n_frames:]
+                    logic = logic[-n_frames:]
+                writer = BufferVideoWriter(
+                    input_queue=frames,
+                    meta_queue=(times, logic),
+                    output_framerate=fps,
+                    kbit_rate=self._clip_kbit_rate,
+                )
+                writer.filename_queue.put(fname)
+                writer.run()
+                self._write_clocksync(fname, anchor, times)
+                self.message_queue.put("I:Clip saved -> " + fname + "video.mp4")
+            except Exception as e:
+                self.message_queue.put("E:Clip save failed: {!r}".format(e))
+            finally:
+                full.reset()
+                try:
+                    self._spare_queue.put_nowait(full)
+                except Full:
+                    pass  # pool already full: let this buffer be GC'd
+
+    def _write_clocksync(self, fname, anchor, times):
+        """One-row CSV bridging the camera hardware clock to the host clocks, so
+        a saved clip aligns to the behaviour/LabJack-pulse logs after the fact."""
+        try:
+            newest = float(times[-1]) if len(times) else float("nan")
+            with open(str(fname) + "clocksync.csv", "w") as f:
+                f.write("newest_frame_timepoint_ns,host_time_s,monotonic_s\n")
+                f.write(
+                    "{:.0f},{:.6f},{:.6f}\n".format(
+                        newest, anchor["host_time"], anchor["monotonic"]
+                    )
+                )
+        except Exception as e:
+            self.message_queue.put("W:clocksync write failed: {!r}".format(e))
 
 
 class VideoFileSource(VideoSource):
@@ -459,5 +585,17 @@ class CameraControlParameters(ParametrizedQt):
             desc="If bigger than 0, the rolling buffer will be replayed at the given framerate",
         )
         self.replay_limits = Param((0, 1200), gui=False)
-        self.save_buffer = Param(False)
+        # v2: monotonic counter -- each increment (from the GUI "save clip"
+        # button or the stimulus) triggers exactly one non-blocking clip save.
+        # Robust to param-sync coalescing in a way a True/False pulse is not.
+        self.save_request_count = Param(0, gui=False)
         self.save_direc = Param(tempfile.gettempdir(), gui="text")
+        # v2: shared basename for a clip, set by the main process so the video
+        # (…video.mp4 / …video_times.csv / …clocksync.csv) pairs up by filename
+        # with the behaviour/stimulus log snapshots it writes. Empty -> the
+        # camera process falls back to its own HHMMSS_ stamp.
+        self.save_clip_basename = Param("", gui=False)
+        # v2: how many seconds of the rolling buffer to save (set by the main
+        # process = min(time since last save, buffer length)). <= 0 -> whole
+        # buffer. Keeps consecutive saves back-to-back and non-overlapping.
+        self.save_clip_seconds = Param(0.0, gui=False)
